@@ -25,6 +25,7 @@ from src.job_discovery import (
     DEFAULT_MAX_JOBS_PER_RUN,
     DEFAULT_PRE_FILTER_THRESHOLD,
     JOB_QUEUE_STATUS_OPTIONS,
+    deduplicate_job_queue,
     discover_from_public_url,
     fetch_job_queue,
     generate_application_prep,
@@ -41,6 +42,7 @@ from src.job_discovery import (
 from src.llm import get_openai_api_key
 from src.networking import generate_networking_messages
 from src.profile import (
+    compute_career_profile_hash,
     generate_career_profile_from_resume,
     get_career_feedback_history,
     get_career_profile,
@@ -692,6 +694,7 @@ def render_analysis_page() -> None:
                     st.session_state.analysis,
                     st.session_state.resume_tailoring,
                     st.session_state.networking_messages,
+                    compute_career_profile_hash(profile),
                 )
                 st.session_state.analysis_user_id = data_links["user_id"]
                 st.session_state.analysis_company_id = data_links["company_id"]
@@ -1168,6 +1171,7 @@ def render_job_discovery_page() -> None:
             if metrics:
                 metric_defaults = {
                     "already_known_jobs": 0,
+                    "stale_cache_hits": 0,
                     "new_jobs": len(metrics.get("queued_jobs", [])),
                     "jobs_rejected_by_rules": 0,
                     "jobs_below_threshold": 0,
@@ -1177,9 +1181,11 @@ def render_job_discovery_page() -> None:
                     "llm_calls_avoided": metrics.get("skipped_llm_calls", 0),
                     "cache_hits": 0,
                     "cache_misses": 0,
+                    "profile_changed_reanalysis_recommended": 0,
                     "estimated_tokens_saved": metrics.get("estimated_token_savings", 0),
                     "token_savings_formula": "llm_calls_avoided * 750 tokens",
                     "known_jobs": [],
+                    "stale_jobs": [],
                     "rejected_by_rules_jobs": [],
                     "below_threshold_jobs": [],
                     "queued_jobs": [],
@@ -1215,6 +1221,19 @@ def render_job_discovery_page() -> None:
                 metric_col9.metric("Pre-scored", metrics["jobs_pre_scored"])
                 metric_col10.metric("Cache Hits", metrics["cache_hits"])
                 metric_col11.metric("Cache Misses", metrics["cache_misses"])
+
+                metric_col12, metric_col13 = st.columns(2)
+                metric_col12.metric("Stale Cache Hits", metrics["stale_cache_hits"])
+                metric_col13.metric(
+                    "Profile Changed / Re-analysis Recommended",
+                    metrics["profile_changed_reanalysis_recommended"],
+                )
+
+                if metrics["profile_changed_reanalysis_recommended"] > 0:
+                    st.warning(
+                        "Some known jobs were analyzed under an older Career Profile. "
+                        "Use Force refresh known jobs to recompute them with the current profile."
+                    )
 
                 st.subheader("Token Efficiency")
                 token_col1, token_col2, token_col3, token_col4, token_col5 = st.columns(5)
@@ -1278,6 +1297,12 @@ def render_job_discovery_page() -> None:
                     else:
                         st.info("No historical jobs were reused from cache.")
 
+                with st.expander("Stale Cache Hits"):
+                    if metrics["stale_jobs"]:
+                        st.dataframe(pd.DataFrame(metrics["stale_jobs"]), width="stretch", hide_index=True)
+                    else:
+                        st.info("No stale cached jobs detected in this run.")
+
                 st.download_button(
                     "Export Discovered Jobs CSV",
                     data=pd.DataFrame(metrics["imported_jobs"]).to_csv(index=False),
@@ -1306,6 +1331,15 @@ def render_job_discovery_page() -> None:
 
 def render_job_queue() -> None:
     st.header("Job Queue")
+    maintenance_col1, maintenance_col2 = st.columns([1, 3])
+    with maintenance_col1:
+        if st.button("Clean Duplicate Queue Records"):
+            results = deduplicate_job_queue()
+            st.success(
+                f"Archived {results['duplicates_archived']} duplicate queue record(s). "
+                f"{results['active_records']} active record(s) remain."
+            )
+            st.rerun()
     queue = fetch_job_queue()
 
     if queue.empty:

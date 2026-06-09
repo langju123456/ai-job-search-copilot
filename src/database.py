@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS model_runs (
     analysis_text TEXT,
     resume_tailoring_text TEXT,
     networking_messages_text TEXT,
+    analysis_profile_hash TEXT,
     created_at TEXT,
     FOREIGN KEY (user_id) REFERENCES users(id),
     FOREIGN KEY (company_id) REFERENCES companies(id),
@@ -126,6 +127,7 @@ CREATE TABLE IF NOT EXISTS job_queue (
     cover_letter TEXT,
     recruiter_message TEXT,
     application_checklist TEXT,
+    analysis_profile_hash TEXT,
     pre_filter_score INTEGER,
     filter_stage TEXT,
     filtered_out_reason TEXT,
@@ -159,6 +161,7 @@ CREATE TABLE IF NOT EXISTS career_profile (
     missing_skills TEXT,
     suggested_locations TEXT,
     suggested_career_paths TEXT,
+    profile_hash TEXT,
     generated_at TEXT,
     updated_at TEXT
 )
@@ -282,9 +285,11 @@ APPLICATION_COLUMN_DEFAULTS = {
     "recruiter_name": "TEXT",
     "next_action": "TEXT",
     "interview_stage": "TEXT",
+    "analysis_profile_hash": "TEXT",
 }
 
 JOB_QUEUE_COLUMN_DEFAULTS = {
+    "analysis_profile_hash": "TEXT",
     "job_title": "TEXT",
     "short_description": "TEXT",
     "source": "TEXT",
@@ -302,6 +307,7 @@ JOB_QUEUE_COLUMN_DEFAULTS = {
 }
 
 CAREER_PROFILE_COLUMN_DEFAULTS = {
+    "profile_hash": "TEXT",
     "headline": "TEXT",
     "summary": "TEXT",
     "education": "TEXT",
@@ -517,10 +523,11 @@ def upsert_career_profile(profile: dict) -> None:
                 missing_skills,
                 suggested_locations,
                 suggested_career_paths,
+                profile_hash,
                 generated_at,
                 updated_at
             )
-            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 headline = excluded.headline,
@@ -538,6 +545,7 @@ def upsert_career_profile(profile: dict) -> None:
                 missing_skills = excluded.missing_skills,
                 suggested_locations = excluded.suggested_locations,
                 suggested_career_paths = excluded.suggested_career_paths,
+                profile_hash = excluded.profile_hash,
                 generated_at = COALESCE(career_profile.generated_at, excluded.generated_at),
                 updated_at = excluded.updated_at
             """,
@@ -558,6 +566,7 @@ def upsert_career_profile(profile: dict) -> None:
                 profile.get("missing_skills", ""),
                 profile.get("suggested_locations", ""),
                 profile.get("suggested_career_paths", ""),
+                profile.get("profile_hash", ""),
                 profile.get("generated_at", ""),
                 profile.get("updated_at", ""),
             ),
@@ -587,6 +596,7 @@ def fetch_career_profile() -> dict:
                 missing_skills,
                 suggested_locations,
                 suggested_career_paths,
+                profile_hash,
                 generated_at,
                 updated_at
             FROM career_profile
@@ -612,6 +622,7 @@ def fetch_career_profile() -> dict:
             "missing_skills": "",
             "suggested_locations": "",
             "suggested_career_paths": "",
+            "profile_hash": "",
             "generated_at": "",
             "updated_at": "",
         }
@@ -633,8 +644,9 @@ def fetch_career_profile() -> dict:
         "missing_skills": row[13] or "",
         "suggested_locations": row[14] or "",
         "suggested_career_paths": row[15] or "",
-        "generated_at": row[16] or "",
-        "updated_at": row[17] or "",
+        "profile_hash": row[16] or "",
+        "generated_at": row[17] or "",
+        "updated_at": row[18] or "",
     }
 
 

@@ -1,5 +1,6 @@
 import json
 import re
+from hashlib import sha256
 from datetime import datetime
 
 from src.database import (
@@ -78,6 +79,28 @@ def derive_skill_summary(skill_rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def compute_career_profile_hash(profile: dict) -> str:
+    base = {
+        "headline": str(profile.get("headline", "") or profile.get("summary", "") or "").strip(),
+        "target_roles": str(profile.get("target_roles", "") or "").strip(),
+        "acceptable_roles": str(profile.get("acceptable_roles", "") or "").strip(),
+        "excluded_roles": str(profile.get("excluded_roles", "") or "").strip(),
+        "preferred_locations": str(profile.get("preferred_locations", "") or "").strip(),
+        "skills": str(profile.get("skills", "") or "").strip(),
+        "constraints": [
+            {
+                "constraint_type": str(row.get("constraint_type", "") or "").strip(),
+                "constraint_value": str(row.get("constraint_value", "") or "").strip(),
+                "severity": str(row.get("severity", "") or "").strip(),
+            }
+            for row in (profile.get("constraints", []) or [])
+            if any(str(row.get(key, "") or "").strip() for key in ["constraint_type", "constraint_value", "severity"])
+        ],
+    }
+    payload = json.dumps(base, sort_keys=True, ensure_ascii=True)
+    return sha256(payload.encode("utf-8")).hexdigest()
+
+
 def normalize_generated_profile(payload: dict) -> dict:
     timestamp = datetime.now().isoformat(timespec="seconds")
     core = {}
@@ -128,6 +151,7 @@ def normalize_generated_profile(payload: dict) -> dict:
         "projects": project_rows,
         "preferences": preference_rows,
         "constraints": constraint_rows,
+        "profile_hash": "",
     }
 
 
@@ -225,6 +249,20 @@ def get_career_profile() -> dict:
     profile["projects"] = project_rows
     profile["preferences"] = preference_rows
     profile["constraints"] = constraint_rows
+    meaningful_values = [
+        profile.get("name", ""),
+        profile.get("headline", ""),
+        profile.get("summary", ""),
+        profile.get("skills", ""),
+        profile.get("target_roles", ""),
+        profile.get("acceptable_roles", ""),
+        profile.get("preferred_locations", ""),
+        profile.get("excluded_roles", ""),
+    ]
+    if any(str(value or "").strip() for value in meaningful_values) or skill_rows or project_rows or preference_rows or constraint_rows:
+        profile["profile_hash"] = profile.get("profile_hash", "") or compute_career_profile_hash(profile)
+    else:
+        profile["profile_hash"] = ""
     return profile
 
 
@@ -237,6 +275,11 @@ def save_career_profile(profile: dict) -> None:
     if not core_profile["skills"]:
         core_profile["skills"] = derive_skill_summary(profile.get("skills_inventory", []))
 
+    profile_with_hash = {
+        **profile,
+        **core_profile,
+    }
+    core_profile["profile_hash"] = compute_career_profile_hash(profile_with_hash)
     upsert_career_profile(core_profile)
     replace_skills(
         clean_rows(

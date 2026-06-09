@@ -94,6 +94,7 @@ def create_model_run(
     analysis_text: str,
     resume_tailoring_text: str,
     networking_messages_text: str,
+    analysis_profile_hash: str = "",
 ) -> int:
     init_db()
     missing_skills = ", ".join(extract_missing_skills(analysis_text))
@@ -115,9 +116,10 @@ def create_model_run(
                 analysis_text,
                 resume_tailoring_text,
                 networking_messages_text,
+                analysis_profile_hash,
                 created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -134,6 +136,7 @@ def create_model_run(
                 analysis_text,
                 resume_tailoring_text,
                 networking_messages_text,
+                analysis_profile_hash,
                 now_iso(),
             ),
         )
@@ -152,6 +155,7 @@ def record_analysis_run(
     analysis_text: str,
     resume_tailoring_text: str,
     networking_messages_text: str,
+    analysis_profile_hash: str = "",
 ) -> dict:
     company_id = get_or_create_company(company_name)
     job_id = create_job(company_id, job_title, location, job_url, job_description)
@@ -164,6 +168,7 @@ def record_analysis_run(
         analysis_text,
         resume_tailoring_text,
         networking_messages_text,
+        analysis_profile_hash,
     )
     return {
         "user_id": DEFAULT_USER_ID,

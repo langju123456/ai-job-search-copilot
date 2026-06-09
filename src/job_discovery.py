@@ -10,6 +10,7 @@ import pandas as pd
 from src.database import get_connection, init_db
 from src.job_analyzer import analyze_job
 from src.llm import call_llm
+from src.profile import compute_career_profile_hash
 from src.resume_assets import resume_assets_to_text, retrieve_relevant_resume_assets
 from src.resume_tailor import tailor_resume
 from src.scoring import (
@@ -657,11 +658,31 @@ def existing_queue_index() -> dict:
                 COALESCE(decision_reason, reason, '') AS decision_reason,
                 analysis_text,
                 pre_filter_score,
-                COALESCE(queue_category, apply_decision, '') AS queue_category
+                COALESCE(queue_category, apply_decision, '') AS queue_category,
+                COALESCE(analysis_profile_hash, '') AS analysis_profile_hash,
+                COALESCE(post_time, 'Unknown') AS post_time,
+                COALESCE(job_level, 'Unknown') AS job_level,
+                COALESCE(work_mode, 'Unknown') AS work_mode,
+                updated_at,
+                id
             FROM job_queue
             """
         ).fetchall()
     cache = {}
+
+    def cache_priority(item: dict) -> tuple:
+        return (
+            1 if int(item.get("fit_score", 0) or 0) > 0 else 0,
+            1 if item.get("apply_decision", "") in ["Apply", "Maybe"] else 0,
+            sum(
+                1
+                for field in ["post_time", "job_level", "work_mode"]
+                if str(item.get(field, "") or "") not in ["", "Unknown"]
+            ),
+            str(item.get("updated_at", "") or ""),
+            int(item.get("id", 0) or 0),
+        )
+
     for row in rows:
         company, job_title, location, job_url = row[:4]
         item = {
@@ -675,19 +696,32 @@ def existing_queue_index() -> dict:
             "analysis_text": row[7] or "",
             "pre_filter_score": row[8] or 0,
             "queue_category": row[9] or "",
+            "analysis_profile_hash": row[10] or "",
+            "post_time": row[11] or "Unknown",
+            "job_level": row[12] or "Unknown",
+            "work_mode": row[13] or "Unknown",
+            "updated_at": row[14] or "",
+            "id": row[15],
         }
-        cache[job_cache_key(item)] = item
+        exact_key = job_cache_key(item)
+        existing_exact = cache.get(exact_key)
+        if not existing_exact or cache_priority(item) >= cache_priority(existing_exact):
+            cache[exact_key] = item
         if item["job_url"]:
-            cache[("", "", "", item["job_url"].lower())] = item
+            url_key = ("", "", "", item["job_url"].lower())
+            existing_url = cache.get(url_key)
+            if not existing_url or cache_priority(item) >= cache_priority(existing_url):
+                cache[url_key] = item
     return cache
 
 
-def deduplicate_jobs(jobs: list, force_refresh: bool = False) -> tuple:
+def deduplicate_jobs(jobs: list, current_profile_hash: str, force_refresh: bool = False) -> tuple:
     existing_jobs = existing_queue_index()
     seen_identities = set()
     seen_urls = set()
     unique_jobs = []
     known_jobs = []
+    stale_jobs = []
     duplicate_jobs = []
 
     for raw_job in jobs:
@@ -697,7 +731,11 @@ def deduplicate_jobs(jobs: list, force_refresh: bool = False) -> tuple:
         exact_key = job_cache_key(job)
         url_cache_key = ("", "", "", url_key)
         cached_job = existing_jobs.get(exact_key) or existing_jobs.get(url_cache_key)
-        is_known = bool(cached_job) and not force_refresh
+        cache_matches_profile = bool(cached_job) and (
+            not cached_job.get("analysis_profile_hash")
+            or cached_job.get("analysis_profile_hash") == current_profile_hash
+        )
+        is_known = bool(cached_job) and cache_matches_profile and not force_refresh
         is_duplicate = identity in seen_identities
         if url_key:
             is_duplicate = is_duplicate or url_key in seen_urls
@@ -710,6 +748,14 @@ def deduplicate_jobs(jobs: list, force_refresh: bool = False) -> tuple:
                     "cached_result": cached_job,
                 }
             )
+        elif bool(cached_job) and not force_refresh:
+            stale_jobs.append(
+                {
+                    **job,
+                    "stale_reason": "Profile changed; re-analysis recommended",
+                    "cached_result": cached_job,
+                }
+            )
         elif is_duplicate:
             duplicate_jobs.append({**job, "duplicate_reason": "Duplicate within current run"})
         else:
@@ -717,7 +763,7 @@ def deduplicate_jobs(jobs: list, force_refresh: bool = False) -> tuple:
             seen_identities.add(identity)
             if url_key:
                 seen_urls.add(url_key)
-    return unique_jobs, known_jobs, duplicate_jobs
+    return unique_jobs, known_jobs, stale_jobs, duplicate_jobs
 
 
 def combined_text(job: dict) -> str:
@@ -1033,6 +1079,7 @@ def insert_job_queue_item(item: dict) -> int:
                 cover_letter,
                 recruiter_message,
                 application_checklist,
+                analysis_profile_hash,
                 sent_to_llm,
                 post_time,
                 job_level,
@@ -1042,7 +1089,7 @@ def insert_job_queue_item(item: dict) -> int:
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 item["company"],
@@ -1064,6 +1111,7 @@ def insert_job_queue_item(item: dict) -> int:
                 item.get("cover_letter", ""),
                 item.get("recruiter_message", ""),
                 item.get("application_checklist", ""),
+                item.get("analysis_profile_hash", ""),
                 item.get("sent_to_llm", 0),
                 item.get("post_time", "Unknown"),
                 item.get("job_level", "Unknown"),
@@ -1117,6 +1165,7 @@ def evaluate_job_without_llm(
 def evaluate_job_with_llm(job: dict, item: dict, user_profile: str, career_profile: dict, career_profile_text: str) -> dict:
     compact_profile = compact_career_profile_text(career_profile, combined_text(job))
     selected_assets = retrieve_relevant_resume_assets(job.get("jd_text", ""), career_profile, limit=5)
+    current_profile_hash = compute_career_profile_hash(career_profile)
     analysis = analyze_job(
         compact_profile or career_profile_text or user_profile,
         compressed_job_text(job),
@@ -1136,6 +1185,7 @@ def evaluate_job_with_llm(job: dict, item: dict, user_profile: str, career_profi
         item["status"] = "Skipped"
     item["queue_category"] = assign_queue_category(item)
     item["analysis_text"] = analysis
+    item["analysis_profile_hash"] = current_profile_hash
     item["sent_to_llm"] = 1
     return item
 
@@ -1153,12 +1203,16 @@ def process_discovered_jobs(
 ) -> dict:
     selected_jobs = jobs[:max_jobs_per_run]
     normalized_jobs = [normalize_job(job) for job in selected_jobs]
-    unique_jobs, known_jobs, duplicate_jobs = deduplicate_jobs(normalized_jobs, force_refresh)
+    current_profile_hash = compute_career_profile_hash(career_profile)
+    unique_jobs, known_jobs, stale_jobs, duplicate_jobs = deduplicate_jobs(
+        normalized_jobs, current_profile_hash, force_refresh
+    )
 
     metrics = {
         "jobs_discovered": len(jobs),
         "selected_jobs": len(selected_jobs),
         "already_known_jobs": len(known_jobs),
+        "stale_cache_hits": len(stale_jobs),
         "new_jobs": len(unique_jobs),
         "jobs_rejected_by_rules": 0,
         "jobs_below_threshold": 0,
@@ -1177,8 +1231,10 @@ def process_discovered_jobs(
         "estimated_token_savings": 0,
         "estimated_tokens_saved": 0,
         "token_savings_formula": f"llm_calls_avoided * {LLM_TOKEN_ESTIMATE_PER_FULL_JOB} tokens",
+        "profile_changed_reanalysis_recommended": len(stale_jobs),
         "imported_jobs": normalized_jobs,
         "known_jobs": known_jobs,
+        "stale_jobs": stale_jobs,
         "duplicate_jobs": duplicate_jobs,
         "rejected_by_rules_jobs": [],
         "below_threshold_jobs": [],
@@ -1215,6 +1271,18 @@ def process_discovered_jobs(
         known_item["queue_category"] = cached_result.get("queue_category", known_item["apply_decision"])
         known_item["status"] = "Reviewed"
         metrics["processed_jobs"].append(known_item)
+
+    for stale_job in stale_jobs:
+        stale_item = empty_queue_item(stale_job)
+        stale_item["fit_score"] = stale_job.get("cached_result", {}).get("fit_score", 0)
+        stale_item["pre_filter_score"] = stale_job.get("cached_result", {}).get("pre_filter_score", 0)
+        stale_item["apply_decision"] = stale_job.get("cached_result", {}).get("apply_decision", "")
+        stale_item["decision_reason"] = stale_job["stale_reason"]
+        stale_item["analysis_text"] = stale_job.get("cached_result", {}).get("analysis_text", "")
+        stale_item["queue_category"] = stale_job.get("cached_result", {}).get("queue_category", "")
+        stale_item["status"] = "Reviewed"
+        stale_item["rejection_reason"] = stale_job["stale_reason"]
+        metrics["processed_jobs"].append(stale_item)
 
     for job in unique_jobs:
         structured_filter = should_filter_job(
@@ -1352,6 +1420,94 @@ def fetch_job_queue() -> pd.DataFrame:
             """,
             conn,
         )
+
+
+def deduplicate_job_queue() -> dict:
+    init_db()
+    with get_connection() as conn:
+        rows = pd.read_sql_query(
+            """
+            SELECT
+                id,
+                company,
+                COALESCE(job_title, title, '') AS job_title,
+                location,
+                job_url,
+                fit_score,
+                apply_decision,
+                COALESCE(post_time, 'Unknown') AS post_time,
+                COALESCE(job_level, 'Unknown') AS job_level,
+                COALESCE(work_mode, 'Unknown') AS work_mode,
+                COALESCE(updated_at, created_at, '') AS updated_at
+            FROM job_queue
+            """,
+            conn,
+        )
+        if rows.empty:
+            return {"duplicates_archived": 0, "active_records": 0}
+
+        def dedup_key(row):
+            url = normalize_text(row["job_url"]).lower()
+            if url:
+                return ("url", url)
+            return (
+                normalize_key(row["company"]),
+                normalize_key(row["job_title"]),
+                normalize_key(row["location"]),
+            )
+
+        def rank(row):
+            return (
+                1 if int(row.get("fit_score", 0) or 0) > 0 else 0,
+                1 if row.get("apply_decision", "") in ["Apply", "Maybe"] else 0,
+                sum(
+                    1
+                    for field in ["post_time", "job_level", "work_mode"]
+                    if str(row.get(field, "") or "") not in ["", "Unknown"]
+                ),
+                str(row.get("updated_at", "") or ""),
+                int(row.get("id", 0) or 0),
+            )
+
+        rows["dedup_key"] = rows.apply(dedup_key, axis=1)
+        archived_ids = []
+        for _, group in rows.groupby("dedup_key"):
+            if len(group) <= 1:
+                continue
+            best_index = max(group.index.tolist(), key=lambda idx: rank(group.loc[idx]))
+            archived_ids.extend(
+                int(group.loc[idx, "id"])
+                for idx in group.index.tolist()
+                if idx != best_index
+            )
+
+        if archived_ids:
+            placeholders = ", ".join(["?"] * len(archived_ids))
+            conn.execute(
+                f"""
+                UPDATE job_queue
+                SET
+                    queue_category = 'Filtered',
+                    status = 'Skipped',
+                    decision_reason = CASE
+                        WHEN COALESCE(decision_reason, '') = '' THEN 'Archived duplicate queue record'
+                        ELSE decision_reason || '; Archived duplicate queue record'
+                    END,
+                    rejection_reason = 'Archived duplicate queue record',
+                    updated_at = ?
+                WHERE id IN ({placeholders})
+                """,
+                (now_iso(), *archived_ids),
+            )
+            conn.commit()
+        active_records = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM job_queue
+            WHERE COALESCE(NULLIF(queue_category, ''), apply_decision, '') IN ('Apply', 'Maybe')
+            """
+        ).fetchone()[0]
+    return {"duplicates_archived": len(archived_ids), "active_records": active_records}
 
 
 def update_job_queue_status(queue_id: int, status: str) -> None:
