@@ -18,6 +18,15 @@ from src.data_collection import (
 )
 from src.file_parser import extract_text_from_uploaded_file
 from src.job_analyzer import analyze_job
+from src.job_discovery import (
+    JOB_QUEUE_STATUS_OPTIONS,
+    fetch_job_queue,
+    parse_csv_jobs,
+    parse_job_urls,
+    process_discovered_job,
+    split_raw_job_descriptions,
+    update_job_queue_status,
+)
 from src.llm import get_openai_api_key
 from src.networking import generate_networking_messages
 from src.profile import get_career_profile, save_career_profile
@@ -505,6 +514,155 @@ def render_analytics_page() -> None:
         st.bar_chart(top_companies.set_index("company")["average_fit_score"])
 
 
+def render_job_discovery_page() -> None:
+    st.header("Job Discovery")
+    st.caption("This page does not scrape websites or submit applications.")
+
+    profile = get_career_profile()
+    career_profile_text = career_profile_to_text(profile)
+
+    with st.form("job_discovery_form"):
+        job_urls = st.text_area(
+            "Paste job URLs",
+            height=120,
+            placeholder="One URL per line. URL-only jobs are queued without scraping.",
+        )
+        raw_jds = st.text_area(
+            "Paste raw job descriptions",
+            height=220,
+            placeholder="Separate multiple job descriptions with a line containing ---",
+        )
+        csv_upload = st.file_uploader(
+            "Upload CSV",
+            type=["csv"],
+            help="Required columns: company, job_title, location, job_url, jd_text",
+        )
+        submitted = st.form_submit_button("Process Jobs")
+
+    if submitted:
+        jobs = []
+        jobs.extend(parse_job_urls(job_urls))
+        for jd_text in split_raw_job_descriptions(raw_jds):
+            jobs.append(
+                {
+                    "company": "",
+                    "job_title": "",
+                    "location": "",
+                    "job_url": "",
+                    "jd_text": jd_text,
+                }
+            )
+        if csv_upload:
+            try:
+                jobs.extend(parse_csv_jobs(csv_upload))
+            except Exception as exc:
+                st.error(f"Could not read CSV: {exc}")
+                jobs = []
+
+        jobs_with_descriptions = [job for job in jobs if job.get("jd_text", "").strip()]
+
+        if not jobs:
+            st.warning("Add at least one job URL, raw job description, or CSV row.")
+        elif jobs_with_descriptions and not st.session_state.user_profile.strip():
+            st.warning("Add your profile/resume on the Analyze Job page before scoring jobs with descriptions.")
+        elif jobs_with_descriptions and not get_openai_api_key():
+            st.warning("OPENAI_API_KEY is missing. Add it to your .env file before processing jobs with descriptions.")
+        else:
+            processed_jobs = []
+            progress = st.progress(0)
+            for index, job in enumerate(jobs, start=1):
+                with st.spinner(f"Processing job {index} of {len(jobs)}..."):
+                    try:
+                        processed_jobs.append(
+                            process_discovered_job(
+                                job,
+                                st.session_state.user_profile,
+                                profile,
+                                career_profile_text,
+                            )
+                        )
+                    except Exception as exc:
+                        st.error(f"Could not process job {index}: {exc}")
+                progress.progress(index / len(jobs))
+
+            if processed_jobs:
+                st.success(f"Processed {len(processed_jobs)} job(s).")
+
+    render_job_queue()
+
+
+def render_job_queue() -> None:
+    st.header("Job Queue")
+    queue = fetch_job_queue()
+
+    if queue.empty:
+        st.info("No discovered jobs yet.")
+        return
+
+    display_columns = [
+        "company",
+        "title",
+        "location",
+        "fit_score",
+        "apply_decision",
+        "reason",
+        "job_url",
+        "status",
+    ]
+    st.dataframe(queue[display_columns], width="stretch", hide_index=True)
+
+    st.subheader("Update Queue Status")
+    with st.form("job_queue_status_form"):
+        options = {
+            f"{row.company} - {row.title or 'Untitled Job'} (#{row.id})": int(row.id)
+            for row in queue.itertuples()
+        }
+        selected_job = st.selectbox("Job", list(options.keys()))
+        status = st.selectbox("Status", JOB_QUEUE_STATUS_OPTIONS)
+        if st.form_submit_button("Update Status"):
+            update_job_queue_status(options[selected_job], status)
+            st.success("Job status updated.")
+
+    apply_jobs = queue[queue["apply_decision"] == "Apply"]
+    if apply_jobs.empty:
+        return
+
+    st.header("Application Prep")
+    prep_options = {
+        f"{row.company} - {row.title or 'Untitled Job'} (#{row.id})": row
+        for row in apply_jobs.itertuples()
+    }
+    selected_prep_label = st.selectbox("Ready-to-apply job", list(prep_options.keys()))
+    selected_prep = prep_options[selected_prep_label]
+
+    st.subheader("Tailored Resume Bullets")
+    st.markdown(selected_prep.resume_bullets or "No resume bullets generated.")
+
+    st.subheader("Cover Letter")
+    st.text_area(
+        "Cover letter",
+        value=selected_prep.cover_letter or "",
+        height=220,
+        key=f"cover_letter_{selected_prep.id}",
+    )
+
+    st.subheader("Recruiter Message")
+    st.text_area(
+        "Recruiter message",
+        value=selected_prep.recruiter_message or "",
+        height=160,
+        key=f"recruiter_message_{selected_prep.id}",
+    )
+
+    st.subheader("Application Checklist")
+    st.text_area(
+        "Checklist",
+        value=selected_prep.application_checklist or "",
+        height=160,
+        key=f"application_checklist_{selected_prep.id}",
+    )
+
+
 initialize_session_state()
 
 st.title("AI Job Search Copilot")
@@ -515,11 +673,20 @@ st.info(
 
 page = st.sidebar.radio(
     "Page",
-    ["Analyze Job", "Setup", "Job Pipeline", "Application Tracker", "Analytics"],
+    [
+        "Analyze Job",
+        "Job Discovery",
+        "Setup",
+        "Job Pipeline",
+        "Application Tracker",
+        "Analytics",
+    ],
 )
 
 if page == "Setup":
     render_setup_page()
+elif page == "Job Discovery":
+    render_job_discovery_page()
 elif page == "Job Pipeline":
     render_pipeline_page()
 elif page == "Application Tracker":

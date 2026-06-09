@@ -24,6 +24,9 @@ Job seekers often spend too much time deciding whether a role is worth applying 
 - Store local data collection records for users, companies, jobs, model runs, outcomes, and feedback
 - Update application outcomes and capture lightweight analysis feedback
 - View analytics for analyzed jobs, applications, interview rate, offer rate, missing skills, and top scoring companies
+- Discover jobs from pasted URLs, pasted job descriptions, or CSV uploads
+- Score discovered jobs and route them into an apply decision queue
+- Generate application prep for Apply decisions without submitting applications
 
 ## Tech Stack
 
@@ -46,10 +49,21 @@ Job seekers often spend too much time deciding whether a role is worth applying 
 - `src/scoring.py` parses structured score components and computes priority
 - `src/profile.py` reads and writes career profile memory
 - `src/data_collection.py` records local learning data and analytics queries
+- `src/job_discovery.py` powers job discovery, apply decisions, queue status, and application prep
 
 ## MVP Data Note
 
 Data is stored locally in SQLite. User data is only sent to the configured LLM API for analysis. There is no multi-user login or authentication in this MVP.
+
+## Job Discovery CSV Format
+
+The Job Discovery page accepts CSV uploads with these columns:
+
+```text
+company,job_title,location,job_url,jd_text
+```
+
+The app does not scrape job URLs and does not submit applications automatically.
 
 ## How To Run Locally
 

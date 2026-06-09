@@ -101,6 +101,31 @@ CREATE TABLE IF NOT EXISTS user_feedback (
 )
 """
 
+CREATE_JOB_QUEUE_TABLE = """
+CREATE TABLE IF NOT EXISTS job_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    company TEXT,
+    title TEXT,
+    location TEXT,
+    required_skills TEXT,
+    years_experience TEXT,
+    visa_sponsorship_hints TEXT,
+    application_platform TEXT,
+    fit_score INTEGER,
+    apply_decision TEXT,
+    reason TEXT,
+    job_url TEXT,
+    status TEXT,
+    jd_text TEXT,
+    analysis_text TEXT,
+    resume_bullets TEXT,
+    cover_letter TEXT,
+    recruiter_message TEXT,
+    application_checklist TEXT,
+    created_at TEXT
+)
+"""
+
 CREATE_CAREER_PROFILE_TABLE = """
 CREATE TABLE IF NOT EXISTS career_profile (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -156,6 +181,7 @@ def init_db() -> None:
         conn.execute(CREATE_OUTCOMES_TABLE)
         conn.execute(CREATE_MODEL_RUNS_TABLE)
         conn.execute(CREATE_USER_FEEDBACK_TABLE)
+        conn.execute(CREATE_JOB_QUEUE_TABLE)
         conn.execute(CREATE_CAREER_PROFILE_TABLE)
         conn.execute(
             """
