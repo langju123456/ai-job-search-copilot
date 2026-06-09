@@ -868,10 +868,16 @@ def process_discovered_jobs(
         "total_new_jobs": len(unique_jobs),
         "jobs_pre_scored": 0,
         "jobs_sent_to_llm": 0,
+        "jobs_added_to_queue": 0,
+        "actual_llm_calls_used": 0,
+        "skipped_llm_calls": 0,
         "estimated_token_savings": 0,
         "imported_jobs": normalized_jobs,
+        "duplicate_jobs": duplicate_jobs,
         "filtered_out_jobs": duplicate_jobs,
+        "pre_scored_jobs": [],
         "jobs_sent_to_llm_rows": [],
+        "jobs_skipped_llm_rows": [],
         "queued_jobs": [],
         "processed_jobs": [],
     }
@@ -890,6 +896,7 @@ def process_discovered_jobs(
         item = evaluate_job_without_llm(job, career_profile, pre_filter_threshold)
         if item["pre_filter_score"] > 0 or item["status"] in ["Reviewed", "Discovered"]:
             metrics["jobs_pre_scored"] += 1
+            metrics["pre_scored_jobs"].append(item)
 
         eligible_for_llm = (
             item["pre_filter_score"] >= pre_filter_threshold
@@ -900,8 +907,17 @@ def process_discovered_jobs(
         if eligible_for_llm:
             item = evaluate_job_with_llm(job, item, user_profile, career_profile, career_profile_text)
             metrics["jobs_sent_to_llm"] += 1
+            metrics["actual_llm_calls_used"] += 1
             metrics["jobs_sent_to_llm_rows"].append(item)
         else:
+            llm_was_skipped = (
+                item["pre_filter_score"] >= pre_filter_threshold
+                and bool(job.get("jd_text", "").strip())
+                and metrics["jobs_sent_to_llm"] >= max_llm_calls_per_run
+            )
+            if llm_was_skipped:
+                metrics["skipped_llm_calls"] += 1
+                metrics["jobs_skipped_llm_rows"].append(item)
             if item["status"] == "Skipped":
                 metrics["jobs_filtered_out"] += 1
                 metrics["filtered_out_jobs"].append(item)
@@ -909,6 +925,7 @@ def process_discovered_jobs(
                 metrics["estimated_token_savings"] += max(250, len(job.get("jd_text", "")) // 4)
 
         insert_job_queue_item(item)
+        metrics["jobs_added_to_queue"] += 1
         metrics["queued_jobs"].append(item)
         metrics["processed_jobs"].append(item)
 
