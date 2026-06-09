@@ -1,4 +1,5 @@
 import re
+from datetime import datetime
 from json import JSONDecodeError
 
 import pandas as pd
@@ -20,6 +21,7 @@ from src.data_collection import (
 )
 from src.file_parser import extract_text_from_uploaded_file
 from src.job_analyzer import analyze_job
+from src.database import get_connection, init_db
 from src.job_discovery import (
     DEFAULT_MAX_LLM_CALLS_PER_RUN,
     DEFAULT_MAX_JOBS_PER_RUN,
@@ -39,7 +41,7 @@ from src.job_discovery import (
     update_job_queue_status,
     upsert_discovered_source,
 )
-from src.llm import get_openai_api_key
+from src.llm import get_openai_api_key, get_openai_model
 from src.networking import generate_networking_messages
 from src.profile import (
     compute_career_profile_hash,
@@ -123,6 +125,9 @@ def initialize_session_state() -> None:
         "analysis_company_id": 0,
         "analysis_job_id": 0,
         "analysis_model_run_id": 0,
+        "last_discovery_metrics": {},
+        "last_discovery_settings": {},
+        "selected_prep_job_id": 0,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -224,6 +229,243 @@ def format_asset_table(dataframe: pd.DataFrame) -> pd.DataFrame:
     return formatted
 
 
+def current_greeting() -> str:
+    hour = datetime.now().hour
+    if hour < 12:
+        return "Good morning"
+    if hour < 18:
+        return "Good afternoon"
+    return "Good evening"
+
+
+def profile_display_name(profile: dict) -> str:
+    name = str(profile.get("name", "") or "").strip()
+    if name:
+        return name.split()[0]
+    return "there"
+
+
+def profile_strength_score(profile: dict) -> int:
+    checks = [
+        bool(str(profile.get("headline", "") or profile.get("summary", "")).strip()),
+        bool(str(profile.get("target_roles", "")).strip()),
+        bool(str(profile.get("preferred_locations", "")).strip()),
+        bool(str(profile.get("visa_status", "")).strip()),
+        bool(str(profile.get("career_goal", "")).strip()),
+        bool(str(profile.get("skills", "")).strip() or (profile.get("skills_inventory", []) or [])),
+        bool(profile.get("projects", []) or []),
+        bool(profile.get("constraints", []) or []),
+    ]
+    return round(sum(checks) / len(checks) * 100)
+
+
+def fetch_queue_records(include_all: bool = False) -> pd.DataFrame:
+    init_db()
+    with get_connection() as conn:
+        query = """
+            SELECT
+                id,
+                company,
+                COALESCE(job_title, title, '') AS job_title,
+                location,
+                job_url,
+                jd_text,
+                short_description,
+                source,
+                COALESCE(post_time, 'Unknown') AS post_time,
+                COALESCE(job_level, 'Unknown') AS job_level,
+                COALESCE(work_mode, 'Unknown') AS work_mode,
+                COALESCE(NULLIF(queue_category, ''), apply_decision, '') AS queue_category,
+                COALESCE(rejection_reason, '') AS rejection_reason,
+                pre_filter_score,
+                fit_score,
+                COALESCE(apply_decision, '') AS apply_decision,
+                COALESCE(decision_reason, reason, '') AS decision_reason,
+                status,
+                resume_bullets,
+                cover_letter,
+                recruiter_message,
+                application_checklist,
+                created_at,
+                updated_at
+            FROM job_queue
+        """
+        if not include_all:
+            query += """
+            WHERE COALESCE(NULLIF(queue_category, ''), apply_decision, '') IN ('Apply', 'Maybe')
+            """
+        query += """
+            ORDER BY
+                CASE COALESCE(NULLIF(queue_category, ''), apply_decision, '')
+                    WHEN 'Apply' THEN 1
+                    WHEN 'Maybe' THEN 2
+                    WHEN 'Filtered' THEN 3
+                    WHEN 'Rejected' THEN 4
+                    ELSE 5
+                END,
+                fit_score DESC,
+                pre_filter_score DESC,
+                created_at DESC
+        """
+        dataframe = pd.read_sql_query(query, conn)
+
+    if dataframe.empty:
+        return dataframe
+
+    defaults = {
+        "post_time": "Unknown",
+        "job_level": "Unknown",
+        "work_mode": "Unknown",
+        "queue_category": "",
+        "rejection_reason": "",
+        "decision_reason": "",
+        "status": "",
+        "fit_score": 0,
+        "pre_filter_score": 0,
+    }
+    for column_name, default_value in defaults.items():
+        if column_name not in dataframe.columns:
+            dataframe[column_name] = default_value
+        dataframe[column_name] = dataframe[column_name].fillna(default_value)
+
+    dataframe["queue_category"] = dataframe["queue_category"].where(
+        dataframe["queue_category"].astype(str).str.strip() != "",
+        dataframe["apply_decision"],
+    )
+    return dataframe
+
+
+def archive_queue_job(queue_id: int) -> None:
+    init_db()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE job_queue
+            SET
+                apply_decision = 'Skip',
+                queue_category = 'Filtered',
+                status = 'Skipped',
+                decision_reason = CASE
+                    WHEN COALESCE(decision_reason, '') = '' THEN 'Skipped by user'
+                    ELSE decision_reason || '; Skipped by user'
+                END,
+                rejection_reason = 'Skipped by user'
+            WHERE id = ?
+            """,
+            (queue_id,),
+        )
+        conn.commit()
+
+
+def render_profile_summary_card(profile: dict) -> None:
+    st.subheader("Profile Summary")
+    if not any(profile.values()):
+        st.info("Create a profile to personalize job matching.")
+        return
+
+    render_labeled_markdown_grid(
+        [
+            ("Headline", compact_text(profile.get("headline") or profile.get("summary"))),
+            ("Target Roles", format_list_block(profile.get("target_roles", ""))),
+            ("Top Skills", compact_text(top_skill_names(profile))),
+            (
+                "Preferred Locations",
+                format_list_block(
+                    profile.get("preferred_locations", "")
+                    or profile.get("suggested_locations", "")
+                ),
+            ),
+            ("Constraints", format_constraints_summary(profile.get("constraints", []))),
+        ]
+    )
+
+
+def render_compact_profile_strip(profile: dict) -> None:
+    if not any(profile.values()):
+        st.warning("Create a Career Profile first for better job matching.")
+        return
+    render_labeled_markdown_grid(
+        [
+            ("Profile Headline", compact_text(profile.get("headline") or profile.get("summary"))),
+            ("Target Roles", format_list_block(profile.get("target_roles", ""))),
+            ("Excluded Roles", format_list_block(profile.get("excluded_roles", ""))),
+            ("Preferred Locations", format_list_block(profile.get("preferred_locations", ""))),
+            ("Top Skills", compact_text(top_skill_names(profile))),
+        ]
+    )
+
+
+def recommend_next_action(profile: dict, queue: pd.DataFrame, applications: pd.DataFrame) -> str:
+    if queue.empty:
+        if not any(profile.values()):
+            return "Create your career profile so the app can start finding better matches."
+        return "Run job discovery to surface fresh matches and build your opportunities list."
+
+    apply_jobs = queue[queue["queue_category"] == "Apply"]
+    if not apply_jobs.empty:
+        top_job = apply_jobs.sort_values(["fit_score", "pre_filter_score"], ascending=False).iloc[0]
+        if not str(top_job.get("resume_bullets", "") or "").strip():
+            return f"Generate an application pack for {top_job['job_title']} at {top_job['company']}."
+        return f"Apply to {top_job['job_title']} at {top_job['company']} while the match is still warm."
+
+    if not applications.empty:
+        pending = applications[
+            applications["status"].isin(["Saved", "Applied", "Networking"])
+        ]
+        if not pending.empty:
+            row = pending.iloc[0]
+            return f"Follow up on {row['job_title']} at {row['company']} and keep momentum going."
+
+    return "Review your Maybe jobs and decide which one deserves a tailored application next."
+
+
+def render_home_page() -> None:
+    profile = get_career_profile()
+    queue = fetch_queue_records()
+    applications = get_applications()
+
+    st.header(f"{current_greeting()}, {profile_display_name(profile)}.")
+    st.caption("Your AI job search workspace is tuned for better matches, clearer tradeoffs, and the next action that matters.")
+
+    summary_col1, summary_col2, summary_col3 = st.columns([1.1, 1, 1])
+    with summary_col1:
+        render_profile_summary_card(profile)
+    with summary_col2:
+        st.subheader("Career Focus")
+        st.metric("Profile Strength", f"{profile_strength_score(profile)}/100")
+        st.markdown("**Target Roles**")
+        st.markdown(format_list_block(profile.get("target_roles", "")))
+        st.markdown("**Preferred Locations**")
+        st.markdown(format_list_block(profile.get("preferred_locations", "")))
+    with summary_col3:
+        st.subheader("Snapshot")
+        st.metric("Best Matches", int(len(queue)))
+        st.metric("Applications", int(len(applications)))
+        st.metric("Interviews", int(len(applications[applications["status"] == "Interview"])))
+
+    st.subheader("Today's Best Opportunities")
+    if queue.empty:
+        st.info("No strong opportunities yet. Start with your profile, then run discovery.")
+    else:
+        top_opportunities = (
+            queue.sort_values(["fit_score", "pre_filter_score"], ascending=False)
+            .head(3)[["company", "job_title", "location", "fit_score", "decision_reason"]]
+            .rename(
+                columns={
+                    "job_title": "Title",
+                    "fit_score": "Match Score",
+                    "decision_reason": "Why It Matches",
+                    "company": "Company",
+                    "location": "Location",
+                }
+            )
+        )
+        st.dataframe(format_decision_table(top_opportunities), width="stretch", hide_index=True)
+
+    st.subheader("Recommended Next Action")
+    st.info(recommend_next_action(profile, queue, applications))
+
+
 def render_setup_page() -> None:
     st.header("Career Profile Setup")
     profile = get_career_profile()
@@ -287,8 +529,11 @@ def render_career_profile_summary(profile: dict) -> None:
     )
 
 
-def render_career_profile_page() -> None:
-    st.header("Career Profile")
+def render_career_profile_page(show_header: bool = True) -> None:
+    if show_header:
+        st.header("Career Profile")
+    else:
+        st.subheader("Career Profile")
     st.caption("Generate and edit the structured profile that powers job discovery, fit scoring, and application prep.")
 
     st.subheader("Resume Input")
@@ -506,8 +751,11 @@ def render_career_profile_page() -> None:
             st.dataframe(feedback_history, width="stretch", hide_index=True)
 
 
-def render_resume_assets_page() -> None:
-    st.header("Resume Assets")
+def render_resume_assets_page(show_header: bool = True) -> None:
+    if show_header:
+        st.header("Resume Assets")
+    else:
+        st.subheader("Resume Assets")
     st.caption("Build a reusable bullet library so application prep can retrieve evidence first and only rewrite what matters.")
 
     profile = get_career_profile()
@@ -593,14 +841,16 @@ def render_score_breakdown() -> None:
     st.dataframe(score_df, width="stretch", hide_index=True)
 
 
-def render_analysis_page() -> None:
+def render_analysis_page(show_header: bool = True) -> None:
     profile = get_career_profile()
     career_profile_text = career_profile_to_text(profile)
 
     if not get_openai_api_key():
         st.warning("OPENAI_API_KEY is missing. Add it to your .env file before running AI analysis.")
 
-    st.header("User Profile / Resume")
+    if show_header:
+        st.header("Analyze A Job")
+    st.subheader("User Profile / Resume")
     resume_upload = st.file_uploader(
         "Upload your profile or resume",
         type=["pdf", "docx", "txt"],
@@ -614,8 +864,9 @@ def render_analysis_page() -> None:
         height=220,
     )
 
-    st.header("Job Description")
-    st.subheader("Job Metadata")
+    st.subheader("Job Description")
+    st.caption("Paste one specific opportunity when you want a full deep-dive, tailored bullets, and networking help.")
+    st.markdown("**Job Metadata**")
     meta_col1, meta_col2 = st.columns(2)
     with meta_col1:
         st.text_input("Company", key="analysis_company")
@@ -704,14 +955,14 @@ def render_analysis_page() -> None:
                 st.error(f"LLM call failed: {exc}")
 
     if st.session_state.analysis:
-        st.header("Job Fit Analysis")
+        st.subheader("Job Fit Analysis")
         render_score_breakdown()
         if st.session_state.priority:
-            st.info(f"Pipeline priority: {st.session_state.priority}")
+            st.info(f"Recommended priority: {st.session_state.priority}")
         st.markdown(st.session_state.analysis)
 
     if st.session_state.resume_tailoring:
-        st.header("Resume Tailoring")
+        st.subheader("Resume Tailoring")
         st.markdown(st.session_state.resume_tailoring)
         st.download_button(
             "Export Resume Suggestions (.txt)",
@@ -721,7 +972,7 @@ def render_analysis_page() -> None:
         )
 
     if st.session_state.networking_messages:
-        st.header("Networking Messages")
+        st.subheader("Networking Messages")
         st.markdown(st.session_state.networking_messages)
         st.download_button(
             "Export Networking Messages (.txt)",
@@ -901,8 +1152,9 @@ def render_pipeline_page() -> None:
         st.dataframe(uncategorized, width="stretch", hide_index=True)
 
 
-def render_tracker_page() -> None:
-    st.header("Application Tracker")
+def render_tracker_page(show_header: bool = True) -> None:
+    if show_header:
+        st.header("Application Tracker")
     applications = get_applications()
 
     total_applications = len(applications)
@@ -937,8 +1189,9 @@ def render_tracker_page() -> None:
             st.success("Outcome updated.")
 
 
-def render_analytics_page() -> None:
-    st.header("Analytics")
+def render_analytics_page(show_header: bool = True) -> None:
+    if show_header:
+        st.header("Analytics")
     summary = fetch_analytics_summary()
 
     col1, col2, col3, col4 = st.columns(4)
@@ -966,8 +1219,9 @@ def render_analytics_page() -> None:
         st.bar_chart(top_companies.set_index("company")["average_fit_score"])
 
 
-def render_job_discovery_page() -> None:
-    st.header("Public Job Discovery")
+def render_job_discovery_page(show_header: bool = True, show_debug: bool = True) -> None:
+    if show_header:
+        st.header("Discover Jobs")
     st.caption(
         "Discover jobs from public pages, CSV, manual paste, or sample data. "
         "This page does not scrape LinkedIn, require login, or submit applications."
@@ -979,20 +1233,9 @@ def render_job_discovery_page() -> None:
 
     profile = get_career_profile()
     profile_text = compact_career_profile_text(profile)
-    st.subheader("Active Career Profile")
+    st.subheader("Using Your Career Profile")
     if profile_text:
-        render_labeled_markdown_grid(
-            [
-                ("Profile Headline", compact_text(profile.get("headline") or profile.get("summary"))),
-                ("Target Roles", format_list_block(profile.get("target_roles", ""))),
-                ("Excluded Roles", format_list_block(profile.get("excluded_roles", ""))),
-                (
-                    "Preferred Locations",
-                    format_list_block(profile.get("preferred_locations", "")),
-                ),
-                ("Top Skills", compact_text(top_skill_names(profile))),
-            ]
-        )
+        render_compact_profile_strip(profile)
     else:
         st.warning("Create a Career Profile first for better job matching.")
 
@@ -1169,6 +1412,8 @@ def render_job_discovery_page() -> None:
                     metrics = None
 
             if metrics:
+                st.session_state.last_discovery_metrics = metrics
+                st.session_state.last_discovery_settings = settings
                 metric_defaults = {
                     "already_known_jobs": 0,
                     "stale_cache_hits": 0,
@@ -1204,104 +1449,125 @@ def render_job_discovery_page() -> None:
                     target_locations,
                     metrics,
                 )
-                st.success(f"Added {metrics['jobs_added_to_queue']} job(s) to the main queue.")
-                metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
-                metric_col1.metric("Jobs Discovered", metrics["jobs_discovered"])
-                metric_col2.metric("Already Known Jobs", metrics["already_known_jobs"])
-                metric_col3.metric("New Jobs", metrics["new_jobs"])
-                metric_col4.metric("Duplicates Removed", metrics["duplicates_removed"])
-
-                metric_col5, metric_col6, metric_col7, metric_col8 = st.columns(4)
-                metric_col5.metric("Rejected by Rules", metrics["jobs_rejected_by_rules"])
-                metric_col6.metric("Below Threshold", metrics["jobs_below_threshold"])
-                metric_col7.metric("Sent to LLM", metrics["jobs_sent_to_llm"])
-                metric_col8.metric("Added to Main Queue", metrics["jobs_added_to_queue"])
-
-                metric_col9, metric_col10, metric_col11 = st.columns(3)
-                metric_col9.metric("Pre-scored", metrics["jobs_pre_scored"])
-                metric_col10.metric("Cache Hits", metrics["cache_hits"])
-                metric_col11.metric("Cache Misses", metrics["cache_misses"])
-
-                metric_col12, metric_col13 = st.columns(2)
-                metric_col12.metric("Stale Cache Hits", metrics["stale_cache_hits"])
-                metric_col13.metric(
-                    "Profile Changed / Re-analysis Recommended",
-                    metrics["profile_changed_reanalysis_recommended"],
-                )
+                if metrics["jobs_added_to_queue"] > 0:
+                    st.success(f"Found {metrics['jobs_added_to_queue']} promising job(s) worth your attention.")
+                else:
+                    st.warning("Discovery finished, but nothing strong enough made it into your active opportunities list yet.")
 
                 if metrics["profile_changed_reanalysis_recommended"] > 0:
                     st.warning(
-                        "Some known jobs were analyzed under an older Career Profile. "
-                        "Use Force refresh known jobs to recompute them with the current profile."
+                        "Some older matches were scored before your latest profile update. "
+                        "Turn on Force refresh known jobs when you want them re-analyzed."
                     )
 
-                st.subheader("Token Efficiency")
-                token_col1, token_col2, token_col3, token_col4, token_col5 = st.columns(5)
-                token_col1.metric("Max Jobs", int(max_jobs_per_run))
-                token_col2.metric("Max LLM Calls", int(max_llm_calls_per_run))
-                token_col3.metric("Actual LLM Calls", metrics["actual_llm_calls_used"])
-                token_col4.metric("LLM Calls Avoided", metrics["llm_calls_avoided"])
-                token_col5.metric("Tokens Saved", metrics["estimated_tokens_saved"])
-                st.caption(f"Formula: {metrics['token_savings_formula']}")
+                if show_debug:
+                    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+                    metric_col1.metric("Jobs Discovered", metrics["jobs_discovered"])
+                    metric_col2.metric("Already Known Jobs", metrics["already_known_jobs"])
+                    metric_col3.metric("New Jobs", metrics["new_jobs"])
+                    metric_col4.metric("Duplicates Removed", metrics["duplicates_removed"])
 
-                if metrics["jobs_sent_to_llm"] >= settings["max_llm_calls_per_run"] and settings["max_llm_calls_per_run"] > 0:
-                    st.warning("Max LLM calls per run was reached. Remaining qualified jobs stayed in the queue without deep analysis.")
+                    metric_col5, metric_col6, metric_col7, metric_col8 = st.columns(4)
+                    metric_col5.metric("Rejected by Rules", metrics["jobs_rejected_by_rules"])
+                    metric_col6.metric("Below Threshold", metrics["jobs_below_threshold"])
+                    metric_col7.metric("Sent to LLM", metrics["jobs_sent_to_llm"])
+                    metric_col8.metric("Added to Main Queue", metrics["jobs_added_to_queue"])
 
-                with st.expander("Rejected by Rules", expanded=True):
-                    if metrics["rejected_by_rules_jobs"]:
-                        st.dataframe(
-                            format_decision_table(pd.DataFrame(metrics["rejected_by_rules_jobs"])),
-                            width="stretch",
-                            hide_index=True,
-                        )
-                    else:
-                        st.info("No jobs were rejected by deterministic rules.")
+                    metric_col9, metric_col10, metric_col11 = st.columns(3)
+                    metric_col9.metric("Pre-scored", metrics["jobs_pre_scored"])
+                    metric_col10.metric("Cache Hits", metrics["cache_hits"])
+                    metric_col11.metric("Cache Misses", metrics["cache_misses"])
 
-                with st.expander("Below Threshold", expanded=True):
-                    if metrics["below_threshold_jobs"]:
-                        st.dataframe(
-                            format_decision_table(pd.DataFrame(metrics["below_threshold_jobs"])),
-                            width="stretch",
-                            hide_index=True,
-                        )
-                    else:
-                        st.info("No jobs fell below the pre-filter threshold.")
+                    metric_col12, metric_col13 = st.columns(2)
+                    metric_col12.metric("Stale Cache Hits", metrics["stale_cache_hits"])
+                    metric_col13.metric(
+                        "Profile Changed / Re-analysis Recommended",
+                        metrics["profile_changed_reanalysis_recommended"],
+                    )
 
-                with st.expander("Sent to LLM"):
-                    sent_to_llm = metrics["jobs_sent_to_llm_rows"]
-                    if sent_to_llm:
-                        st.dataframe(
-                            format_decision_table(pd.DataFrame(sent_to_llm)),
-                            width="stretch",
-                            hide_index=True,
-                        )
-                    else:
-                        st.info("No jobs were sent to the LLM in this run.")
+                    st.subheader("Token Efficiency")
+                    token_col1, token_col2, token_col3, token_col4, token_col5 = st.columns(5)
+                    token_col1.metric("Max Jobs", int(max_jobs_per_run))
+                    token_col2.metric("Max LLM Calls", int(max_llm_calls_per_run))
+                    token_col3.metric("Actual LLM Calls", metrics["actual_llm_calls_used"])
+                    token_col4.metric("LLM Calls Avoided", metrics["llm_calls_avoided"])
+                    token_col5.metric("Tokens Saved", metrics["estimated_tokens_saved"])
+                    st.caption(f"Formula: {metrics['token_savings_formula']}")
 
-                with st.expander("Main Queue", expanded=True):
-                    if metrics["queued_jobs"]:
-                        st.dataframe(
-                            format_decision_table(pd.DataFrame(metrics["queued_jobs"])),
-                            width="stretch",
-                            hide_index=True,
-                        )
-                    else:
-                        st.info("No jobs qualified for the main queue in this run.")
+                    if metrics["jobs_sent_to_llm"] >= settings["max_llm_calls_per_run"] and settings["max_llm_calls_per_run"] > 0:
+                        st.warning("Max LLM calls per run was reached. Remaining qualified jobs stayed in the queue without deep analysis.")
 
-                with st.expander("Full Raw Discovery Log"):
-                    st.dataframe(metrics["processed_jobs"], width="stretch", hide_index=True)
+                    with st.expander("Rejected by Rules", expanded=True):
+                        if metrics["rejected_by_rules_jobs"]:
+                            st.dataframe(
+                                format_decision_table(pd.DataFrame(metrics["rejected_by_rules_jobs"])),
+                                width="stretch",
+                                hide_index=True,
+                            )
+                        else:
+                            st.info("No jobs were rejected by deterministic rules.")
 
-                with st.expander("Already Known Jobs"):
-                    if metrics["known_jobs"]:
-                        st.dataframe(pd.DataFrame(metrics["known_jobs"]), width="stretch", hide_index=True)
-                    else:
-                        st.info("No historical jobs were reused from cache.")
+                    with st.expander("Below Threshold", expanded=True):
+                        if metrics["below_threshold_jobs"]:
+                            st.dataframe(
+                                format_decision_table(pd.DataFrame(metrics["below_threshold_jobs"])),
+                                width="stretch",
+                                hide_index=True,
+                            )
+                        else:
+                            st.info("No jobs fell below the pre-filter threshold.")
 
-                with st.expander("Stale Cache Hits"):
-                    if metrics["stale_jobs"]:
-                        st.dataframe(pd.DataFrame(metrics["stale_jobs"]), width="stretch", hide_index=True)
-                    else:
-                        st.info("No stale cached jobs detected in this run.")
+                    with st.expander("Sent to LLM"):
+                        sent_to_llm = metrics["jobs_sent_to_llm_rows"]
+                        if sent_to_llm:
+                            st.dataframe(
+                                format_decision_table(pd.DataFrame(sent_to_llm)),
+                                width="stretch",
+                                hide_index=True,
+                            )
+                        else:
+                            st.info("No jobs were sent to the LLM in this run.")
+
+                    with st.expander("Main Queue", expanded=True):
+                        if metrics["queued_jobs"]:
+                            st.dataframe(
+                                format_decision_table(pd.DataFrame(metrics["queued_jobs"])),
+                                width="stretch",
+                                hide_index=True,
+                            )
+                        else:
+                            st.info("No jobs qualified for the main queue in this run.")
+
+                    with st.expander("Full Raw Discovery Log"):
+                        st.dataframe(metrics["processed_jobs"], width="stretch", hide_index=True)
+
+                    with st.expander("Already Known Jobs"):
+                        if metrics["known_jobs"]:
+                            st.dataframe(pd.DataFrame(metrics["known_jobs"]), width="stretch", hide_index=True)
+                        else:
+                            st.info("No historical jobs were reused from cache.")
+
+                    with st.expander("Stale Cache Hits"):
+                        if metrics["stale_jobs"]:
+                            st.dataframe(pd.DataFrame(metrics["stale_jobs"]), width="stretch", hide_index=True)
+                        else:
+                            st.info("No stale cached jobs detected in this run.")
+
+                    with st.expander("Duplicates Removed"):
+                        if metrics["duplicate_jobs"]:
+                            st.dataframe(pd.DataFrame(metrics["duplicate_jobs"]), width="stretch", hide_index=True)
+                        else:
+                            st.info("No duplicates removed in this run.")
+
+                    with st.expander("Pre-Scored Jobs", expanded=True):
+                        if metrics["pre_scored_jobs"]:
+                            st.dataframe(
+                                format_decision_table(pd.DataFrame(metrics["pre_scored_jobs"])),
+                                width="stretch",
+                                hide_index=True,
+                            )
+                        else:
+                            st.info("No jobs reached pre-scoring in this run.")
 
                 st.download_button(
                     "Export Discovered Jobs CSV",
@@ -1310,27 +1576,10 @@ def render_job_discovery_page() -> None:
                     mime="text/csv",
                 )
 
-                with st.expander("Duplicates Removed"):
-                    if metrics["duplicate_jobs"]:
-                        st.dataframe(pd.DataFrame(metrics["duplicate_jobs"]), width="stretch", hide_index=True)
-                    else:
-                        st.info("No duplicates removed in this run.")
 
-                with st.expander("Pre-Scored Jobs", expanded=True):
-                    if metrics["pre_scored_jobs"]:
-                        st.dataframe(
-                            format_decision_table(pd.DataFrame(metrics["pre_scored_jobs"])),
-                            width="stretch",
-                            hide_index=True,
-                        )
-                    else:
-                        st.info("No jobs reached pre-scoring in this run.")
-
-    render_job_queue()
-
-
-def render_job_queue() -> None:
-    st.header("Job Queue")
+def render_job_queue(show_header: bool = True) -> None:
+    if show_header:
+        st.header("Best Matches")
     maintenance_col1, maintenance_col2 = st.columns([1, 3])
     with maintenance_col1:
         if st.button("Clean Duplicate Queue Records"):
@@ -1340,35 +1589,19 @@ def render_job_queue() -> None:
                 f"{results['active_records']} active record(s) remain."
             )
             st.rerun()
-    queue = fetch_job_queue()
+    queue = fetch_queue_records()
+    full_queue = fetch_queue_records(include_all=True)
 
     if queue.empty:
         st.info("No discovered jobs yet.")
         return
 
-    queue_defaults = {
-        "post_time": "Unknown",
-        "job_level": "Unknown",
-        "work_mode": "Unknown",
-        "queue_category": "",
-        "rejection_reason": "",
-    }
-    for column_name, default_value in queue_defaults.items():
-        if column_name not in queue.columns:
-            queue[column_name] = default_value
-    queue["queue_category"] = queue["queue_category"].where(
-        queue["queue_category"].astype(str).str.strip() != "",
-        queue["apply_decision"],
-    )
-
     display_columns = [
         "company",
         "job_title",
         "location",
-        "source",
-        "post_time",
-        "job_level",
         "work_mode",
+        "job_level",
         "pre_filter_score",
         "fit_score",
         "apply_decision",
@@ -1376,47 +1609,35 @@ def render_job_queue() -> None:
         "status",
         "job_url",
     ]
-    decision_col1, decision_col2 = st.columns(2)
-    with decision_col1:
-        apply_only = st.checkbox("Apply only")
-    with decision_col2:
-        maybe_only = st.checkbox("Maybe only")
-
     filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
     with filter_col1:
-        post_time_filter = st.text_input("Post time")
+        company_filter = st.text_input("Company filter", key="opps_company_filter")
     with filter_col2:
-        job_level_filter = st.selectbox(
-            "Job level",
-            ["All", "Internship", "Entry", "Junior", "Mid", "Senior", "Staff", "Principal", "Director", "Unknown"],
-        )
+        location_filter = st.text_input("Location filter", key="opps_location_filter")
     with filter_col3:
-        work_mode_filter = st.selectbox("Work mode", ["All", "Remote", "Hybrid", "Onsite", "Unknown"])
+        source_filter = st.text_input("Source filter", key="opps_source_filter")
     with filter_col4:
-        source_filter = st.text_input("Source filter")
+        minimum_fit_score = st.number_input("Minimum match score", 0, 100, 0, 5, key="opps_fit_min")
 
     filter_col5, filter_col6, filter_col7, filter_col8 = st.columns(4)
     with filter_col5:
-        location_filter = st.text_input("Location filter")
+        post_time_filter = st.text_input("Post time", key="opps_post_time_filter")
     with filter_col6:
-        company_filter = st.text_input("Company filter")
+        job_level_filter = st.selectbox(
+            "Level",
+            ["All", "Internship", "Entry", "Junior", "Mid", "Senior", "Staff", "Principal", "Director", "Unknown"],
+            key="opps_job_level_filter",
+        )
     with filter_col7:
-        minimum_pre_filter_score = st.number_input("Minimum pre-filter score", 0, 100, 0, 5)
+        work_mode_filter = st.selectbox(
+            "Work mode",
+            ["All", "Remote", "Hybrid", "Onsite", "Unknown"],
+            key="opps_work_mode_filter",
+        )
     with filter_col8:
-        minimum_fit_score = st.number_input("Minimum fit score", 0, 100, 0, 5)
+        minimum_pre_filter_score = st.number_input("Minimum pre-filter score", 0, 100, 0, 5, key="opps_prefilter_min")
 
     filtered_queue = queue.copy()
-    filtered_queue = filtered_queue[
-        filtered_queue["queue_category"].isin(["Apply", "Maybe"])
-    ]
-    if apply_only and maybe_only:
-        filtered_queue = filtered_queue[
-            filtered_queue["queue_category"].isin(["Apply", "Maybe"])
-        ]
-    elif apply_only:
-        filtered_queue = filtered_queue[filtered_queue["queue_category"] == "Apply"]
-    elif maybe_only:
-        filtered_queue = filtered_queue[filtered_queue["queue_category"] == "Maybe"]
     if post_time_filter:
         filtered_queue = filtered_queue[
             filtered_queue["post_time"].str.contains(post_time_filter, case=False, na=False)
@@ -1442,11 +1663,126 @@ def render_job_queue() -> None:
             filtered_queue["location"].str.contains(location_filter, case=False, na=False)
         ]
 
-    st.dataframe(
-        format_decision_table(filtered_queue[display_columns]),
-        width="stretch",
-        hide_index=True,
+    best_tab, apply_tab, maybe_tab, archived_tab = st.tabs(
+        ["Best Matches", "Apply", "Maybe", "Skip / Archived"]
     )
+
+    with best_tab:
+        best_matches = filtered_queue.sort_values(["fit_score", "pre_filter_score"], ascending=False)
+        display_best = best_matches[display_columns].rename(
+            columns={
+                "job_title": "Title",
+                "fit_score": "Match Score",
+                "apply_decision": "Decision",
+                "decision_reason": "Reason",
+                "job_level": "Level",
+                "job_url": "Job URL",
+                "company": "Company",
+                "location": "Location",
+                "work_mode": "Work Mode",
+                "status": "Status",
+                "source": "Source",
+                "pre_filter_score": "Pre-Score",
+            }
+        )
+        st.dataframe(format_decision_table(display_best), width="stretch", hide_index=True)
+
+    with apply_tab:
+        apply_rows = filtered_queue[filtered_queue["queue_category"] == "Apply"]
+        if apply_rows.empty:
+            st.info("No Apply opportunities match your filters right now.")
+        else:
+            st.dataframe(
+                format_decision_table(
+                    apply_rows[display_columns].rename(
+                        columns={
+                            "job_title": "Title",
+                            "fit_score": "Match Score",
+                            "apply_decision": "Decision",
+                            "decision_reason": "Reason",
+                            "job_level": "Level",
+                            "job_url": "Job URL",
+                            "company": "Company",
+                            "location": "Location",
+                            "work_mode": "Work Mode",
+                            "status": "Status",
+                            "pre_filter_score": "Pre-Score",
+                        }
+                    )
+                ),
+                width="stretch",
+                hide_index=True,
+            )
+
+    with maybe_tab:
+        maybe_rows = filtered_queue[filtered_queue["queue_category"] == "Maybe"]
+        if maybe_rows.empty:
+            st.info("No Maybe opportunities match your filters right now.")
+        else:
+            st.dataframe(
+                format_decision_table(
+                    maybe_rows[display_columns].rename(
+                        columns={
+                            "job_title": "Title",
+                            "fit_score": "Match Score",
+                            "apply_decision": "Decision",
+                            "decision_reason": "Reason",
+                            "job_level": "Level",
+                            "job_url": "Job URL",
+                            "company": "Company",
+                            "location": "Location",
+                            "work_mode": "Work Mode",
+                            "status": "Status",
+                            "pre_filter_score": "Pre-Score",
+                        }
+                    )
+                ),
+                width="stretch",
+                hide_index=True,
+            )
+
+    with archived_tab:
+        archived_rows = full_queue[
+            full_queue["queue_category"].isin(["Filtered", "Rejected"])
+            | full_queue["status"].isin(["Skipped"])
+            | full_queue["apply_decision"].isin(["Skip"])
+        ]
+        if archived_rows.empty:
+            st.info("No skipped or archived opportunities yet.")
+        else:
+            st.dataframe(
+                format_decision_table(
+                    archived_rows[
+                        [
+                            "company",
+                            "job_title",
+                            "location",
+                            "work_mode",
+                            "job_level",
+                            "fit_score",
+                            "apply_decision",
+                            "decision_reason",
+                            "status",
+                            "job_url",
+                        ]
+                    ].rename(
+                        columns={
+                            "job_title": "Title",
+                            "fit_score": "Match Score",
+                            "apply_decision": "Decision",
+                            "decision_reason": "Reason",
+                            "job_level": "Level",
+                            "job_url": "Job URL",
+                            "company": "Company",
+                            "location": "Location",
+                            "work_mode": "Work Mode",
+                            "status": "Status",
+                        }
+                    )
+                ),
+                width="stretch",
+                hide_index=True,
+            )
 
     apply_queue = queue[queue["apply_decision"] == "Apply"]
     if not apply_queue.empty:
@@ -1457,31 +1793,60 @@ def render_job_queue() -> None:
             mime="text/csv",
         )
 
-    st.subheader("Update Queue Status")
-    with st.form("job_queue_status_form"):
-        options = {
-            f"{row.company} - {row.job_title or 'Untitled Job'} (#{row.id})": int(row.id)
-            for row in filtered_queue.itertuples()
-        }
-        if not options:
-            st.info("No jobs match the current filters.")
-            return
-        selected_job = st.selectbox("Job", list(options.keys()))
-        status = st.selectbox("Status", JOB_QUEUE_STATUS_OPTIONS)
-        if st.form_submit_button("Update Status"):
-            update_job_queue_status(options[selected_job], status)
-            st.success("Job status updated.")
+    st.subheader("Take Next Action")
+    options = {
+        f"{row.company} - {row.job_title or 'Untitled Job'} (#{row.id})": int(row.id)
+        for row in filtered_queue.itertuples()
+    }
+    if not options:
+        st.info("No jobs match the current filters.")
+        return
+
+    action_col1, action_col2 = st.columns([2, 3])
+    with action_col1:
+        selected_job_label = st.selectbox("Opportunity", list(options.keys()))
+        selected_job_id = options[selected_job_label]
+        st.session_state.selected_prep_job_id = selected_job_id
+    with action_col2:
+        action_button_col1, action_button_col2, action_button_col3, action_button_col4 = st.columns(4)
+        with action_button_col1:
+            generate_prep = st.button("Generate Application Pack")
+        with action_button_col2:
+            mark_applied = st.button("Mark Applied")
+        with action_button_col3:
+            skip_job = st.button("Skip")
+        with action_button_col4:
+            save_for_later = st.button("Save for Later")
+
+    if mark_applied:
+        update_job_queue_status(selected_job_id, "Applied")
+        st.success("Marked as applied.")
+        st.rerun()
+    if skip_job:
+        archive_queue_job(selected_job_id)
+        st.success("Moved to archived opportunities.")
+        st.rerun()
+    if save_for_later:
+        update_job_queue_status(selected_job_id, "Reviewed")
+        st.success("Saved for later review.")
+        st.rerun()
 
     apply_jobs = apply_queue
     if apply_jobs.empty:
         return
 
-    st.header("Application Prep")
+    st.subheader("Application Prep")
     prep_options = {
         f"{row.company} - {row.job_title or 'Untitled Job'} (#{row.id})": row
         for row in apply_jobs.itertuples()
     }
-    selected_prep_label = st.selectbox("Ready-to-apply job", list(prep_options.keys()))
+    prep_labels = list(prep_options.keys())
+    default_index = 0
+    for index, label in enumerate(prep_labels):
+        if prep_options[label].id == st.session_state.get("selected_prep_job_id"):
+            default_index = index
+            break
+    selected_prep_label = st.selectbox("Ready-to-apply job", prep_labels, index=default_index)
     selected_prep = prep_options[selected_prep_label]
     prep_profile = get_career_profile()
     prep_assets = retrieve_relevant_resume_assets(
@@ -1517,7 +1882,7 @@ def render_job_queue() -> None:
     st.subheader("Tailored Resume Bullets")
     if not selected_prep.resume_bullets and selected_prep.jd_text:
         st.caption("This uses an LLM call.")
-        if st.button("Generate Application Prep"):
+        if st.button("Generate Application Prep", key=f"generate_prep_{selected_prep.id}") or generate_prep:
             if not st.session_state.user_profile.strip():
                 st.warning("Add your profile/resume on the Analyze Job page before generating prep.")
             elif not get_openai_api_key():
@@ -1562,6 +1927,243 @@ def render_job_queue() -> None:
     )
 
 
+def render_profile_page() -> None:
+    st.header("Profile")
+    st.caption("This is your career memory: the profile, projects, skills, and reusable resume evidence behind every match.")
+    render_profile_summary_card(get_career_profile())
+    st.divider()
+    render_career_profile_page(show_header=False)
+    st.divider()
+    render_resume_assets_page(show_header=False)
+
+
+def render_opportunities_page() -> None:
+    st.header("Opportunities")
+    st.caption("Discover jobs, review your best matches, and move quickly on the ones worth applying to.")
+    profile = get_career_profile()
+    render_compact_profile_strip(profile)
+    discover_tab, queue_tab, analyze_tab = st.tabs(
+        ["Discover Jobs", "Best Matches", "Analyze A Specific Job"]
+    )
+    with discover_tab:
+        render_job_discovery_page(show_header=False, show_debug=False)
+    with queue_tab:
+        render_job_queue(show_header=False)
+    with analyze_tab:
+        render_analysis_page(show_header=False)
+
+
+def render_applications_page() -> None:
+    st.header("Applications")
+    st.caption("Track what you saved, where you applied, and what needs a follow-up next.")
+    applications = get_applications()
+
+    if applications.empty:
+        st.info("No saved applications yet.")
+        return
+
+    status_map = {
+        "Saved": applications["status"] == "Saved",
+        "Applied": applications["status"] == "Applied",
+        "Interview": applications["status"] == "Interview",
+        "Offer": applications["status"] == "Offer",
+        "Rejected": applications["status"] == "Rejected",
+        "No Response": (
+            applications["outcome_status"].fillna("").eq("No Response")
+            | applications["status"].fillna("").eq("No Response")
+        ),
+    }
+    metric_cols = st.columns(6)
+    for column, (label, mask) in zip(metric_cols, status_map.items()):
+        column.metric(label, int(mask.sum()))
+
+    display = applications[
+        [
+            "company",
+            "job_title",
+            "application_date",
+            "status",
+            "follow_up_date",
+            "next_action",
+            "notes",
+        ]
+    ].rename(
+        columns={
+            "company": "Company",
+            "job_title": "Title",
+            "application_date": "Date Applied",
+            "status": "Status",
+            "follow_up_date": "Follow-up Date",
+            "next_action": "Next Action",
+            "notes": "Notes",
+        }
+    )
+    st.dataframe(display, width="stretch", hide_index=True)
+
+    st.divider()
+    render_tracker_page(show_header=False)
+
+
+def render_insights_page() -> None:
+    st.header("Insights")
+    st.caption("Use these signals to sharpen your search, highlight the right work, and close the most important gaps.")
+    profile = get_career_profile()
+    queue = fetch_queue_records()
+    top_companies = fetch_top_scoring_companies()
+    missing_skills = fetch_most_common_missing_skills()
+
+    insight_col1, insight_col2 = st.columns(2)
+    with insight_col1:
+        st.subheader("Best Role Matches")
+        if queue.empty:
+            st.info("Not enough analyzed opportunities yet. Run discovery or analyze a specific job to unlock role-level insights.")
+        else:
+            best_roles = (
+                queue.sort_values("fit_score", ascending=False)
+                .head(5)[["job_title", "company", "fit_score"]]
+                .rename(columns={"job_title": "Role", "company": "Company", "fit_score": "Match Score"})
+            )
+            st.dataframe(best_roles, width="stretch", hide_index=True)
+
+        st.subheader("Common Missing Skills")
+        if missing_skills.empty:
+            fallback = compact_text(profile.get("missing_skills", ""), "")
+            if fallback:
+                st.markdown(format_list_block(fallback))
+            else:
+                st.info("No missing-skill trends yet. Once more jobs are analyzed, this section will get sharper.")
+        else:
+            st.dataframe(missing_skills.head(8), width="stretch", hide_index=True)
+
+        st.subheader("Best Projects To Highlight")
+        projects = profile.get("projects", []) or []
+        if not projects:
+            st.info("Add projects to your profile so the app can surface stronger application evidence.")
+        else:
+            project_rows = pd.DataFrame(projects)[
+                ["project_name", "technical_stack", "business_impact", "target_roles_supported"]
+            ].rename(
+                columns={
+                    "project_name": "Project",
+                    "technical_stack": "Technical Stack",
+                    "business_impact": "Business Impact",
+                    "target_roles_supported": "Supported Roles",
+                }
+            )
+            st.dataframe(project_rows.head(5), width="stretch", hide_index=True)
+
+    with insight_col2:
+        st.subheader("Companies Worth Tracking")
+        if top_companies.empty:
+            st.info("No company trend data yet. Save and analyze more jobs to build this view.")
+        else:
+            st.dataframe(top_companies, width="stretch", hide_index=True)
+
+        st.subheader("Skill Gaps")
+        if missing_skills.empty and not str(profile.get("missing_skills", "")).strip():
+            st.info("No clear skill gaps yet. The app will summarize them as your opportunity set grows.")
+        else:
+            skill_gap_text = profile.get("missing_skills", "")
+            if str(skill_gap_text).strip():
+                st.markdown(format_list_block(skill_gap_text))
+
+        st.subheader("Suggested Next Actions")
+        suggestions = []
+        if queue.empty:
+            suggestions.append("Run discovery with sample data or public job pages to create an opportunities list.")
+        if not (profile.get("projects", []) or []):
+            suggestions.append("Add project evidence to your profile so match explanations can point to proof.")
+        if missing_skills.empty and not str(profile.get("missing_skills", "")).strip():
+            suggestions.append("Analyze a few target roles to surface recurring skill gaps.")
+        if not suggestions:
+            suggestions.append(recommend_next_action(profile, queue, get_applications()))
+        st.markdown("\n".join(f"- {item}" for item in suggestions))
+
+
+def render_settings_page() -> None:
+    st.header("Settings / Usage")
+    st.caption("API setup, usage controls, and deeper pipeline diagnostics live here instead of the main job-search workflow.")
+
+    api_col1, api_col2 = st.columns(2)
+    with api_col1:
+        st.subheader("API Settings")
+        st.metric("OpenAI API Key", "Configured" if get_openai_api_key() else "Missing")
+        st.text_input("Model", value=get_openai_model(), disabled=True)
+        st.caption("Future provider settings can live here later without changing the current app flow.")
+    with api_col2:
+        st.subheader("Usage Limits")
+        last_settings = st.session_state.get("last_discovery_settings", {}) or {}
+        st.metric("Max LLM Calls Per Run", int(last_settings.get("max_llm_calls_per_run", DEFAULT_MAX_LLM_CALLS_PER_RUN)))
+        st.metric("Max Jobs Per Run", int(last_settings.get("max_jobs_per_run", DEFAULT_MAX_JOBS_PER_RUN)))
+        st.metric("Pre-filter Threshold", int(last_settings.get("pre_filter_threshold", DEFAULT_PRE_FILTER_THRESHOLD)))
+
+    metrics = st.session_state.get("last_discovery_metrics", {}) or {}
+    st.divider()
+    st.subheader("Usage")
+    if not metrics:
+        st.info("Run job discovery to populate usage and cache metrics.")
+    else:
+        usage_col1, usage_col2, usage_col3, usage_col4 = st.columns(4)
+        usage_col1.metric("LLM Calls", int(metrics.get("actual_llm_calls_used", metrics.get("jobs_sent_to_llm", 0))))
+        usage_col2.metric("Cache Hits", int(metrics.get("cache_hits", 0)))
+        usage_col3.metric("Stale Cache Hits", int(metrics.get("stale_cache_hits", 0)))
+        usage_col4.metric("Cache Misses", int(metrics.get("cache_misses", 0)))
+
+        usage_col5, usage_col6, usage_col7, usage_col8 = st.columns(4)
+        usage_col5.metric("Estimated Tokens Saved", int(metrics.get("estimated_tokens_saved", 0)))
+        usage_col6.metric("Discovery Runtime", "Session-based")
+        usage_col7.metric("Jobs Sent To LLM", int(metrics.get("jobs_sent_to_llm", 0)))
+        usage_col8.metric("LLM Calls Avoided", int(metrics.get("llm_calls_avoided", 0)))
+
+    st.divider()
+    st.subheader("Advanced Debug")
+    if not metrics:
+        st.info("No discovery debug data in this session yet.")
+    else:
+        with st.expander("Pipeline Metrics", expanded=True):
+            st.json(
+                {
+                    "jobs_discovered": metrics.get("jobs_discovered", 0),
+                    "already_known_jobs": metrics.get("already_known_jobs", 0),
+                    "new_jobs": metrics.get("new_jobs", 0),
+                    "duplicates_removed": metrics.get("duplicates_removed", 0),
+                    "jobs_rejected_by_rules": metrics.get("jobs_rejected_by_rules", 0),
+                    "jobs_below_threshold": metrics.get("jobs_below_threshold", 0),
+                    "jobs_pre_scored": metrics.get("jobs_pre_scored", 0),
+                    "jobs_sent_to_llm": metrics.get("jobs_sent_to_llm", 0),
+                    "jobs_added_to_queue": metrics.get("jobs_added_to_queue", 0),
+                    "estimated_tokens_saved": metrics.get("estimated_tokens_saved", 0),
+                }
+            )
+        with st.expander("Raw Discovery Log"):
+            processed_jobs = metrics.get("processed_jobs", [])
+            if processed_jobs:
+                st.dataframe(pd.DataFrame(processed_jobs), width="stretch", hide_index=True)
+            else:
+                st.info("No raw discovery log captured in this session.")
+        with st.expander("Recent Model Run Logs"):
+            init_db()
+            with get_connection() as conn:
+                model_runs = pd.read_sql_query(
+                    """
+                    SELECT
+                        id,
+                        model_name,
+                        fit_score,
+                        created_at,
+                        substr(analysis_text, 1, 240) AS analysis_excerpt
+                    FROM model_runs
+                    ORDER BY id DESC
+                    LIMIT 10
+                    """,
+                    conn,
+                )
+            if model_runs.empty:
+                st.info("No model run logs yet.")
+            else:
+                st.dataframe(model_runs, width="stretch", hide_index=True)
+
+
 initialize_session_state()
 
 st.title("AI Job Search Copilot")
@@ -1573,30 +2175,24 @@ st.info(
 page = st.sidebar.radio(
     "Page",
     [
-        "Analyze Job",
-        "Career Profile",
-        "Resume Assets",
-        "Job Discovery",
-        "Setup",
-        "Job Pipeline",
-        "Application Tracker",
-        "Analytics",
+        "Home",
+        "Profile",
+        "Opportunities",
+        "Applications",
+        "Insights",
+        "Settings / Usage",
     ],
 )
 
-if page == "Setup":
-    render_setup_page()
-elif page == "Career Profile":
-    render_career_profile_page()
-elif page == "Resume Assets":
-    render_resume_assets_page()
-elif page == "Job Discovery":
-    render_job_discovery_page()
-elif page == "Job Pipeline":
-    render_pipeline_page()
-elif page == "Application Tracker":
-    render_tracker_page()
-elif page == "Analytics":
-    render_analytics_page()
+if page == "Home":
+    render_home_page()
+elif page == "Profile":
+    render_profile_page()
+elif page == "Opportunities":
+    render_opportunities_page()
+elif page == "Applications":
+    render_applications_page()
+elif page == "Insights":
+    render_insights_page()
 else:
-    render_analysis_page()
+    render_settings_page()
