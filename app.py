@@ -1,5 +1,6 @@
 import re
 
+import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -20,16 +21,21 @@ from src.file_parser import extract_text_from_uploaded_file
 from src.job_analyzer import analyze_job
 from src.job_discovery import (
     DEFAULT_MAX_LLM_CALLS_PER_RUN,
+    DEFAULT_MAX_JOBS_PER_RUN,
     DEFAULT_PRE_FILTER_THRESHOLD,
     JOB_QUEUE_STATUS_OPTIONS,
+    discover_from_public_url,
     fetch_job_queue,
     generate_application_prep,
+    load_sample_discovered_jobs,
     parse_manual_jobs,
     parse_csv_jobs,
     parse_job_urls,
-    process_discovered_jobs,
+    record_discovery_run,
+    run_discovery_pipeline,
     update_application_prep,
     update_job_queue_status,
+    upsert_discovered_source,
 )
 from src.llm import get_openai_api_key
 from src.networking import generate_networking_messages
@@ -519,15 +525,70 @@ def render_analytics_page() -> None:
 
 
 def render_job_discovery_page() -> None:
-    st.header("Job Discovery")
-    st.caption("This page does not scrape websites or submit applications.")
+    st.header("Public Job Discovery")
+    st.caption(
+        "Discover jobs from public pages, CSV, manual paste, or sample data. "
+        "This page does not scrape LinkedIn, require login, or submit applications."
+    )
 
     profile = get_career_profile()
-    career_profile_text = career_profile_to_text(profile)
 
     with st.form("job_discovery_form"):
+        st.subheader("Job Search Settings")
+        settings_col1, settings_col2 = st.columns(2)
+        with settings_col1:
+            target_roles = st.text_input(
+                "Target roles",
+                value=profile.get("target_roles", ""),
+                placeholder="AI Engineer, GenAI Engineer, AI Application Engineer",
+            )
+            keywords = st.text_input(
+                "Keywords",
+                value="AI, GenAI, LLM, RAG, Python, FastAPI, SaaS",
+            )
+            pre_filter_threshold = st.number_input(
+                "Pre-filter threshold",
+                min_value=0,
+                max_value=100,
+                value=DEFAULT_PRE_FILTER_THRESHOLD,
+                step=5,
+            )
+        with settings_col2:
+            target_locations = st.text_input(
+                "Target locations",
+                value=profile.get("preferred_locations", ""),
+                placeholder="Remote, San Francisco, New York",
+            )
+            excluded_keywords = st.text_input(
+                "Excluded keywords",
+                value="Staff, Principal, Director, VP, commission only, unpaid",
+            )
+            max_jobs_per_run = st.number_input(
+                "Max jobs per run",
+                min_value=1,
+                max_value=200,
+                value=DEFAULT_MAX_JOBS_PER_RUN,
+                step=5,
+            )
+        max_llm_calls_per_run = st.number_input(
+            "Max LLM calls per run",
+            min_value=0,
+            max_value=50,
+            value=DEFAULT_MAX_LLM_CALLS_PER_RUN,
+            step=1,
+        )
+
+        st.subheader("Sources")
+        career_page_url = st.text_input(
+            "Public career page URL",
+            placeholder="https://company.com/careers",
+        )
+        job_board_url = st.text_input(
+            "Public job board/search result URL",
+            placeholder="Greenhouse, Lever, Ashby, company site, etc. No LinkedIn scraping.",
+        )
         job_urls = st.text_area(
-            "Paste job URLs",
+            "Paste job URLs manually",
             height=120,
             placeholder="One URL per line. URL-only jobs are queued without scraping.",
         )
@@ -541,48 +602,83 @@ def render_job_discovery_page() -> None:
             type=["csv"],
             help="Required columns: company, job_title, location, job_url, jd_text",
         )
-        settings_col1, settings_col2, settings_col3 = st.columns(3)
-        with settings_col1:
-            pre_filter_threshold = st.number_input(
-                "Pre-filter threshold",
-                min_value=0,
-                max_value=100,
-                value=DEFAULT_PRE_FILTER_THRESHOLD,
-                step=5,
-            )
-        with settings_col2:
-            max_jobs_per_run = st.number_input(
-                "Max jobs per run",
-                min_value=1,
-                max_value=200,
-                value=50,
-                step=5,
-            )
-        with settings_col3:
-            max_llm_calls_per_run = st.number_input(
-                "Max LLM calls per run",
-                min_value=0,
-                max_value=50,
-                value=DEFAULT_MAX_LLM_CALLS_PER_RUN,
-                step=1,
-            )
-        submitted = st.form_submit_button("Process Jobs")
+        use_sample_data = st.checkbox("Use sample dataset mode")
+        submitted = st.form_submit_button("Run Discovery")
 
     if submitted:
         jobs = []
+        source_names = []
+        source_types = []
+        discovery_profile = {
+            **profile,
+            "target_roles": target_roles or profile.get("target_roles", ""),
+            "preferred_locations": target_locations or profile.get("preferred_locations", ""),
+        }
+        settings = {
+            "target_roles": target_roles,
+            "target_locations": target_locations,
+            "keywords": keywords,
+            "excluded_keywords": excluded_keywords,
+            "pre_filter_threshold": int(pre_filter_threshold),
+            "max_jobs_per_run": int(max_jobs_per_run),
+            "max_llm_calls_per_run": int(max_llm_calls_per_run),
+            "user_profile": st.session_state.user_profile,
+            "career_profile": discovery_profile,
+            "career_profile_text": career_profile_to_text(discovery_profile),
+        }
+
+        if use_sample_data:
+            try:
+                sample_jobs = load_sample_discovered_jobs()
+                jobs.extend(sample_jobs)
+                source_names.append("Sample Dataset")
+                source_types.append("sample")
+                upsert_discovered_source("Sample Dataset", "data/sample_discovered_jobs.csv", "sample")
+            except Exception as exc:
+                st.warning(f"Could not load sample data: {exc}")
+
+        public_urls = [
+            ("Career Page", career_page_url),
+            ("Job Board", job_board_url),
+        ]
+        for label, public_url in public_urls:
+            if not public_url.strip():
+                continue
+            try:
+                public_jobs = discover_from_public_url(public_url, settings)
+                jobs.extend(public_jobs)
+                source_names.append(label)
+                source_types.append("public_html")
+                upsert_discovered_source(label, public_url, "public_html")
+                if not public_jobs:
+                    st.warning(f"No jobs were found at {public_url}.")
+            except Exception as exc:
+                st.warning(f"Could not fetch {label} URL: {exc}")
+
         jobs.extend(parse_job_urls(job_urls))
+        if job_urls.strip():
+            source_names.append("Manual URLs")
+            source_types.append("manual")
+
         jobs.extend(parse_manual_jobs(raw_jds))
+        if raw_jds.strip():
+            source_names.append("Manual Pasted Jobs")
+            source_types.append("manual")
+
         if csv_upload:
             try:
-                jobs.extend(parse_csv_jobs(csv_upload))
+                csv_jobs = parse_csv_jobs(csv_upload)
+                jobs.extend(csv_jobs)
+                source_names.append(csv_upload.name)
+                source_types.append("csv")
+                upsert_discovered_source(csv_upload.name, csv_upload.name, "csv")
             except Exception as exc:
-                st.error(f"Could not read CSV: {exc}")
-                jobs = []
+                st.warning(f"Could not read CSV: {exc}")
 
         jobs_with_descriptions = [job for job in jobs if job.get("jd_text", "").strip()]
 
         if not jobs:
-            st.warning("Add at least one job URL, raw job description, or CSV row.")
+            st.warning("No jobs found. Add a public URL, CSV, manual jobs, job URLs, or enable sample dataset mode.")
         elif jobs_with_descriptions and not st.session_state.user_profile.strip():
             st.warning("Add your profile/resume on the Analyze Job page before scoring jobs with descriptions.")
         elif jobs_with_descriptions and not get_openai_api_key():
@@ -590,30 +686,38 @@ def render_job_discovery_page() -> None:
         else:
             with st.spinner("Running discovery filters and LLM-limited deep analysis..."):
                 try:
-                    metrics = process_discovered_jobs(
-                        jobs,
-                        st.session_state.user_profile,
-                        profile,
-                        career_profile_text,
-                        int(pre_filter_threshold),
-                        int(max_llm_calls_per_run),
-                        int(max_jobs_per_run),
-                    )
+                    metrics = run_discovery_pipeline(jobs, settings)
                 except Exception as exc:
-                    st.error(f"Could not process discovered jobs: {exc}")
+                    st.warning(f"Could not process discovered jobs: {exc}")
                     metrics = None
 
             if metrics:
-                st.success(f"Processed {len(metrics['processed_jobs'])} job(s).")
+                record_discovery_run(
+                    ", ".join(source_names) or "Manual Discovery",
+                    ", ".join(sorted(set(source_types))) or "manual",
+                    keywords,
+                    target_locations,
+                    metrics,
+                )
+                st.success(f"Queued {len(metrics['queued_jobs'])} new job(s).")
                 metric_col1, metric_col2, metric_col3, metric_col4, metric_col5 = st.columns(5)
                 metric_col1.metric("Jobs Discovered", metrics["jobs_discovered"])
-                metric_col2.metric("Filtered Out", metrics["jobs_filtered_out"])
-                metric_col3.metric("Pre-scored", metrics["jobs_pre_scored"])
+                metric_col2.metric("Duplicates Removed", metrics["duplicates_removed"])
+                metric_col3.metric("Filtered Out", metrics["jobs_filtered_out"])
                 metric_col4.metric("Sent to LLM", metrics["jobs_sent_to_llm"])
                 metric_col5.metric("Est. Token Savings", metrics["estimated_token_savings"])
 
+                if metrics["jobs_sent_to_llm"] >= int(max_llm_calls_per_run) and int(max_llm_calls_per_run) > 0:
+                    st.warning("Max LLM calls per run was reached. Remaining qualified jobs stayed in the queue without deep analysis.")
+
                 st.subheader("Imported Jobs")
                 st.dataframe(metrics["imported_jobs"], width="stretch", hide_index=True)
+                st.download_button(
+                    "Export Discovered Jobs CSV",
+                    data=pd.DataFrame(metrics["imported_jobs"]).to_csv(index=False),
+                    file_name="discovered_jobs.csv",
+                    mime="text/csv",
+                )
 
                 st.subheader("Filtered Out Jobs")
                 st.dataframe(metrics["filtered_out_jobs"], width="stretch", hide_index=True)
@@ -624,6 +728,9 @@ def render_job_discovery_page() -> None:
                     st.dataframe(sent_to_llm, width="stretch", hide_index=True)
                 else:
                     st.info("No jobs were sent to the LLM in this run.")
+
+                st.subheader("Final Queued Jobs From This Run")
+                st.dataframe(metrics["queued_jobs"], width="stretch", hide_index=True)
 
     render_job_queue()
 
@@ -640,6 +747,7 @@ def render_job_queue() -> None:
         "company",
         "job_title",
         "location",
+        "source",
         "pre_filter_score",
         "fit_score",
         "apply_decision",
@@ -647,20 +755,26 @@ def render_job_queue() -> None:
         "job_url",
         "status",
     ]
-    filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
+    filter_col1, filter_col2, filter_col3, filter_col4, filter_col5 = st.columns(5)
     with filter_col1:
         decision_filter = st.selectbox("Decision", ["All", "Apply", "Maybe", "Skip"])
     with filter_col2:
         minimum_fit_score = st.number_input("Minimum fit score", 0, 100, 0, 5)
     with filter_col3:
-        company_filter = st.text_input("Company filter")
+        source_filter = st.text_input("Source filter")
     with filter_col4:
+        company_filter = st.text_input("Company filter")
+    with filter_col5:
         location_filter = st.text_input("Location filter")
 
     filtered_queue = queue.copy()
     if decision_filter != "All":
         filtered_queue = filtered_queue[filtered_queue["apply_decision"] == decision_filter]
     filtered_queue = filtered_queue[filtered_queue["fit_score"] >= minimum_fit_score]
+    if source_filter:
+        filtered_queue = filtered_queue[
+            filtered_queue["source"].str.contains(source_filter, case=False, na=False)
+        ]
     if company_filter:
         filtered_queue = filtered_queue[
             filtered_queue["company"].str.contains(company_filter, case=False, na=False)
@@ -671,6 +785,15 @@ def render_job_queue() -> None:
         ]
 
     st.dataframe(filtered_queue[display_columns], width="stretch", hide_index=True)
+
+    apply_queue = queue[queue["apply_decision"] == "Apply"]
+    if not apply_queue.empty:
+        st.download_button(
+            "Export Apply Queue CSV",
+            data=apply_queue[display_columns].to_csv(index=False),
+            file_name="apply_queue.csv",
+            mime="text/csv",
+        )
 
     st.subheader("Update Queue Status")
     with st.form("job_queue_status_form"):
@@ -687,7 +810,7 @@ def render_job_queue() -> None:
             update_job_queue_status(options[selected_job], status)
             st.success("Job status updated.")
 
-    apply_jobs = queue[queue["apply_decision"] == "Apply"]
+    apply_jobs = apply_queue
     if apply_jobs.empty:
         return
 

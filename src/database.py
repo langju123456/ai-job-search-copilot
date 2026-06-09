@@ -148,6 +148,34 @@ CREATE TABLE IF NOT EXISTS career_profile (
 )
 """
 
+CREATE_JOB_DISCOVERY_RUNS_TABLE = """
+CREATE TABLE IF NOT EXISTS job_discovery_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_name TEXT,
+    source_type TEXT,
+    search_keywords TEXT,
+    target_locations TEXT,
+    total_discovered INTEGER,
+    total_new_jobs INTEGER,
+    total_duplicates INTEGER,
+    total_filtered_out INTEGER,
+    total_sent_to_llm INTEGER,
+    created_at TEXT
+)
+"""
+
+CREATE_DISCOVERED_SOURCES_TABLE = """
+CREATE TABLE IF NOT EXISTS discovered_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_name TEXT,
+    source_url TEXT,
+    source_type TEXT,
+    enabled INTEGER,
+    created_at TEXT,
+    updated_at TEXT
+)
+"""
+
 APPLICATION_COLUMN_DEFAULTS = {
     "user_id": "INTEGER",
     "company_id": "INTEGER",
@@ -214,6 +242,8 @@ def init_db() -> None:
         conn.execute(CREATE_JOB_QUEUE_TABLE)
         ensure_job_queue_columns(conn)
         conn.execute(CREATE_CAREER_PROFILE_TABLE)
+        conn.execute(CREATE_JOB_DISCOVERY_RUNS_TABLE)
+        conn.execute(CREATE_DISCOVERED_SOURCES_TABLE)
         conn.execute(
             """
             INSERT OR IGNORE INTO users (id, name, created_at)

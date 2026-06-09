@@ -25,9 +25,12 @@ Job seekers often spend too much time deciding whether a role is worth applying 
 - Update application outcomes and capture lightweight analysis feedback
 - View analytics for analyzed jobs, applications, interview rate, offer rate, missing skills, and top scoring companies
 - Discover jobs from pasted URLs, pasted job descriptions, or CSV uploads
+- Discover jobs from public career/job board pages with requests and BeautifulSoup
+- Run sample discovery mode with a local sample dataset
 - Score discovered jobs and route them into an apply decision queue
 - Generate application prep for Apply decisions without submitting applications
 - Run token-efficient batch evaluation with normalization, deduplication, rule-based filtering, keyword pre-scoring, and capped LLM deep analysis
+- Export discovered jobs and the Apply queue as CSV files
 
 ## Tech Stack
 
@@ -37,6 +40,8 @@ Job seekers often spend too much time deciding whether a role is worth applying 
 - OpenAI API
 - Pandas
 - python-dotenv
+- requests
+- BeautifulSoup
 
 ## Architecture
 
@@ -64,11 +69,15 @@ The Job Discovery page accepts CSV uploads with these columns:
 company,job_title,location,job_url,jd_text
 ```
 
-The app does not scrape job URLs and does not submit applications automatically.
+The app can parse public HTML pages, but it does not scrape LinkedIn directly, bypass captchas, use browser automation, require login, or submit applications automatically.
 
 ## Token-Efficient Job Queue
 
 The Job Discovery page avoids sending every job to the LLM. It first normalizes and deduplicates jobs, then applies rule-based filtering and weighted keyword pre-scoring. Only jobs above the configured pre-filter threshold and within the `max_llm_calls_per_run` budget are sent to OpenAI for deep analysis.
+
+## Public Job Discovery
+
+The app supports public career pages, public job board/search result pages, CSV uploads, pasted jobs, pasted URLs, and sample dataset mode. Discovered jobs are normalized, deduplicated, filtered cheaply, and then routed into the same Job Queue pipeline.
 
 ## How To Run Locally
 

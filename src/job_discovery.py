@@ -1,7 +1,8 @@
 import json
 import re
 from datetime import datetime
-from urllib.parse import urlparse
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
 import pandas as pd
 
@@ -25,6 +26,7 @@ REQUIRED_CSV_COLUMNS = ["company", "job_title", "location", "job_url", "jd_text"
 DEFAULT_PRE_FILTER_THRESHOLD = 40
 DEFAULT_MAX_JOBS_PER_RUN = 100
 DEFAULT_MAX_LLM_CALLS_PER_RUN = 10
+SAMPLE_DISCOVERED_JOBS_PATH = Path("data/sample_discovered_jobs.csv")
 
 POSITIVE_KEYWORDS = [
     "ai",
@@ -113,6 +115,12 @@ def infer_company_from_url(job_url: str) -> str:
     if not host:
         return ""
     return host.split(".")[0].replace("-", " ").title()
+
+
+def source_name_from_url(url: str) -> str:
+    parsed = urlparse((url or "").strip())
+    host = parsed.netloc.replace("www.", "")
+    return host or "public_html"
 
 
 def infer_title_from_jd(jd_text: str) -> str:
@@ -205,6 +213,264 @@ def parse_csv_jobs(uploaded_file) -> list:
             }
         )
     return jobs
+
+
+def fetch_public_html(url: str) -> str:
+    clean_url = normalize_text(url)
+    if not clean_url:
+        raise ValueError("Source URL is empty.")
+    if "linkedin.com" in clean_url.lower():
+        raise ValueError("LinkedIn scraping is not supported in this MVP. Use CSV or manual paste instead.")
+
+    try:
+        import requests
+    except ImportError as exc:
+        raise RuntimeError("requests is not installed. Run pip install -r requirements.txt.") from exc
+
+    response = requests.get(
+        clean_url,
+        timeout=15,
+        headers={
+            "User-Agent": "AIJobSearchCopilot/0.1 (+local Streamlit MVP)",
+            "Accept": "text/html,application/xhtml+xml",
+        },
+    )
+    response.raise_for_status()
+    return response.text
+
+
+def _get_soup(html: str):
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError as exc:
+        raise RuntimeError("beautifulsoup4 is not installed. Run pip install -r requirements.txt.") from exc
+    return BeautifulSoup(html or "", "html.parser")
+
+
+def extract_job_links_from_html(html: str, base_url: str) -> list:
+    soup = _get_soup(html)
+    jobs = []
+    job_terms = [
+        "job",
+        "career",
+        "opening",
+        "position",
+        "role",
+        "greenhouse",
+        "lever",
+        "workday",
+        "ashby",
+    ]
+
+    for anchor in soup.find_all("a", href=True):
+        href = anchor.get("href", "").strip()
+        text = normalize_text(anchor.get_text(" "))
+        combined = f"{href} {text}".lower()
+        if not text and not href:
+            continue
+        if not any(term in combined for term in job_terms):
+            continue
+
+        absolute_url = urljoin(base_url, href)
+        jobs.append(
+            {
+                "company": infer_company_from_url(absolute_url) or source_name_from_url(base_url),
+                "job_title": text[:120],
+                "location": "",
+                "job_url": absolute_url,
+                "jd_text": text,
+                "short_description": text,
+                "source": "public_html",
+            }
+        )
+    return jobs
+
+
+def _looks_like_job_card(element) -> bool:
+    attrs = " ".join(
+        [
+            " ".join(element.get("class", [])),
+            element.get("id", ""),
+            element.get("data-testid", ""),
+        ]
+    ).lower()
+    text = normalize_text(element.get_text(" ")).lower()
+    return any(term in attrs for term in ["job", "opening", "position", "role", "listing"]) or (
+        any(term in text for term in POSITIVE_KEYWORDS)
+        and any(term in text for term in ["apply", "remote", "engineer", "consultant", "location"])
+    )
+
+
+def _extract_location_from_text(text: str) -> str:
+    location_patterns = [
+        r"\b(Remote(?:\s*-\s*[A-Za-z ,]+)?)\b",
+        r"\b(San Francisco|New York|Seattle|Austin|Boston|Los Angeles|Chicago|Atlanta|Dallas|Denver|Toronto|London)\b",
+        r"\b([A-Z][a-z]+,\s*(?:CA|NY|WA|TX|MA|IL|GA|CO|FL|NJ))\b",
+    ]
+    for pattern in location_patterns:
+        match = re.search(pattern, text)
+        if match:
+            return normalize_text(match.group(1))
+    return ""
+
+
+def extract_job_cards_from_html(html: str, base_url: str) -> list:
+    soup = _get_soup(html)
+    jobs = []
+    candidates = soup.find_all(["article", "li", "div", "section"])
+
+    for element in candidates:
+        if not _looks_like_job_card(element):
+            continue
+
+        card_text = normalize_text(element.get_text(" "))
+        if len(card_text) < 20:
+            continue
+
+        anchor = element.find("a", href=True)
+        job_url = urljoin(base_url, anchor.get("href", "")) if anchor else ""
+        anchor_text = normalize_text(anchor.get_text(" ")) if anchor else ""
+        heading = element.find(["h1", "h2", "h3", "h4"])
+        heading_text = normalize_text(heading.get_text(" ")) if heading else ""
+        title = heading_text or anchor_text or card_text[:90]
+
+        jobs.append(
+            {
+                "company": source_name_from_url(base_url),
+                "job_title": title[:120],
+                "location": _extract_location_from_text(card_text),
+                "job_url": job_url,
+                "jd_text": card_text,
+                "short_description": card_text[:700],
+                "source": "public_html",
+            }
+        )
+    return jobs
+
+
+def normalize_discovered_job(raw_job: dict) -> dict:
+    return normalize_job(raw_job)
+
+
+def discover_from_public_url(url: str, settings=None) -> list:
+    settings = settings or {}
+    html = fetch_public_html(url)
+    jobs = extract_job_cards_from_html(html, url)
+    jobs.extend(extract_job_links_from_html(html, url))
+
+    keywords = normalize_text(settings.get("keywords", "")).lower()
+    excluded_keywords = normalize_text(settings.get("excluded_keywords", "")).lower()
+    keyword_terms = [term.strip() for term in re.split(r"[,;]", keywords) if term.strip()]
+    excluded_terms = [term.strip() for term in re.split(r"[,;]", excluded_keywords) if term.strip()]
+
+    normalized_jobs = [normalize_discovered_job(job) for job in jobs]
+    if keyword_terms:
+        normalized_jobs = [
+            job for job in normalized_jobs if any(term in combined_text(job) for term in keyword_terms)
+        ]
+    if excluded_terms:
+        normalized_jobs = [
+            job for job in normalized_jobs if not any(term in combined_text(job) for term in excluded_terms)
+        ]
+    return normalized_jobs
+
+
+def load_sample_discovered_jobs() -> list:
+    df = pd.read_csv(SAMPLE_DISCOVERED_JOBS_PATH)
+    missing_columns = [column for column in REQUIRED_CSV_COLUMNS if column not in df.columns]
+    if missing_columns:
+        raise ValueError(f"Sample dataset is missing columns: {', '.join(missing_columns)}")
+    return [
+        {
+            "company": row["company"],
+            "job_title": row["job_title"],
+            "location": row["location"],
+            "job_url": row["job_url"],
+            "jd_text": row["jd_text"],
+            "source": "sample",
+        }
+        for row in df[REQUIRED_CSV_COLUMNS].fillna("").to_dict(orient="records")
+    ]
+
+
+def upsert_discovered_source(source_name: str, source_url: str, source_type: str, enabled: int = 1) -> None:
+    init_db()
+    timestamp = now_iso()
+    with get_connection() as conn:
+        existing = conn.execute(
+            """
+            SELECT id
+            FROM discovered_sources
+            WHERE source_url = ? AND source_type = ?
+            """,
+            (source_url, source_type),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE discovered_sources
+                SET source_name = ?, enabled = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (source_name, enabled, timestamp, existing[0]),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO discovered_sources (
+                    source_name,
+                    source_url,
+                    source_type,
+                    enabled,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (source_name, source_url, source_type, enabled, timestamp, timestamp),
+            )
+        conn.commit()
+
+
+def record_discovery_run(
+    source_name: str,
+    source_type: str,
+    search_keywords: str,
+    target_locations: str,
+    metrics: dict,
+) -> None:
+    init_db()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO job_discovery_runs (
+                source_name,
+                source_type,
+                search_keywords,
+                target_locations,
+                total_discovered,
+                total_new_jobs,
+                total_duplicates,
+                total_filtered_out,
+                total_sent_to_llm,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                source_name,
+                source_type,
+                search_keywords,
+                target_locations,
+                metrics.get("jobs_discovered", 0),
+                metrics.get("total_new_jobs", 0),
+                metrics.get("duplicates_removed", 0),
+                metrics.get("jobs_filtered_out", 0),
+                metrics.get("jobs_sent_to_llm", 0),
+                now_iso(),
+            ),
+        )
+        conn.commit()
 
 
 def normalize_job(job: dict) -> dict:
@@ -598,12 +864,15 @@ def process_discovered_jobs(
     metrics = {
         "jobs_discovered": len(jobs),
         "jobs_filtered_out": len(duplicate_jobs),
+        "duplicates_removed": len(duplicate_jobs),
+        "total_new_jobs": len(unique_jobs),
         "jobs_pre_scored": 0,
         "jobs_sent_to_llm": 0,
         "estimated_token_savings": 0,
         "imported_jobs": normalized_jobs,
         "filtered_out_jobs": duplicate_jobs,
         "jobs_sent_to_llm_rows": [],
+        "queued_jobs": [],
         "processed_jobs": [],
     }
 
@@ -633,14 +902,29 @@ def process_discovered_jobs(
             metrics["jobs_sent_to_llm"] += 1
             metrics["jobs_sent_to_llm_rows"].append(item)
         else:
-            metrics["jobs_filtered_out"] += 1
+            if item["status"] == "Skipped":
+                metrics["jobs_filtered_out"] += 1
+                metrics["filtered_out_jobs"].append(item)
             if not item["sent_to_llm"]:
                 metrics["estimated_token_savings"] += max(250, len(job.get("jd_text", "")) // 4)
 
         insert_job_queue_item(item)
+        metrics["queued_jobs"].append(item)
         metrics["processed_jobs"].append(item)
 
     return metrics
+
+
+def run_discovery_pipeline(jobs: list, settings: dict) -> dict:
+    return process_discovered_jobs(
+        jobs,
+        settings.get("user_profile", ""),
+        settings.get("career_profile", {}),
+        settings.get("career_profile_text", ""),
+        int(settings.get("pre_filter_threshold", DEFAULT_PRE_FILTER_THRESHOLD)),
+        int(settings.get("max_llm_calls_per_run", DEFAULT_MAX_LLM_CALLS_PER_RUN)),
+        int(settings.get("max_jobs_per_run", DEFAULT_MAX_JOBS_PER_RUN)),
+    )
 
 
 def fetch_job_queue() -> pd.DataFrame:
