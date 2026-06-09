@@ -27,6 +27,7 @@ Job seekers often spend too much time deciding whether a role is worth applying 
 - Discover jobs from pasted URLs, pasted job descriptions, or CSV uploads
 - Score discovered jobs and route them into an apply decision queue
 - Generate application prep for Apply decisions without submitting applications
+- Run token-efficient batch evaluation with normalization, deduplication, rule-based filtering, keyword pre-scoring, and capped LLM deep analysis
 
 ## Tech Stack
 
@@ -64,6 +65,10 @@ company,job_title,location,job_url,jd_text
 ```
 
 The app does not scrape job URLs and does not submit applications automatically.
+
+## Token-Efficient Job Queue
+
+The Job Discovery page avoids sending every job to the LLM. It first normalizes and deduplicates jobs, then applies rule-based filtering and weighted keyword pre-scoring. Only jobs above the configured pre-filter threshold and within the `max_llm_calls_per_run` budget are sent to OpenAI for deep analysis.
 
 ## How To Run Locally
 

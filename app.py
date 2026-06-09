@@ -19,12 +19,16 @@ from src.data_collection import (
 from src.file_parser import extract_text_from_uploaded_file
 from src.job_analyzer import analyze_job
 from src.job_discovery import (
+    DEFAULT_MAX_LLM_CALLS_PER_RUN,
+    DEFAULT_PRE_FILTER_THRESHOLD,
     JOB_QUEUE_STATUS_OPTIONS,
     fetch_job_queue,
+    generate_application_prep,
+    parse_manual_jobs,
     parse_csv_jobs,
     parse_job_urls,
-    process_discovered_job,
-    split_raw_job_descriptions,
+    process_discovered_jobs,
+    update_application_prep,
     update_job_queue_status,
 )
 from src.llm import get_openai_api_key
@@ -528,30 +532,46 @@ def render_job_discovery_page() -> None:
             placeholder="One URL per line. URL-only jobs are queued without scraping.",
         )
         raw_jds = st.text_area(
-            "Paste raw job descriptions",
+            "Paste multiple jobs manually",
             height=220,
-            placeholder="Separate multiple job descriptions with a line containing ---",
+            placeholder="Company:\nTitle:\nLocation:\nURL:\nDescription:\n---\nCompany:\nTitle:\nLocation:\nURL:\nDescription:",
         )
         csv_upload = st.file_uploader(
             "Upload CSV",
             type=["csv"],
             help="Required columns: company, job_title, location, job_url, jd_text",
         )
+        settings_col1, settings_col2, settings_col3 = st.columns(3)
+        with settings_col1:
+            pre_filter_threshold = st.number_input(
+                "Pre-filter threshold",
+                min_value=0,
+                max_value=100,
+                value=DEFAULT_PRE_FILTER_THRESHOLD,
+                step=5,
+            )
+        with settings_col2:
+            max_jobs_per_run = st.number_input(
+                "Max jobs per run",
+                min_value=1,
+                max_value=200,
+                value=50,
+                step=5,
+            )
+        with settings_col3:
+            max_llm_calls_per_run = st.number_input(
+                "Max LLM calls per run",
+                min_value=0,
+                max_value=50,
+                value=DEFAULT_MAX_LLM_CALLS_PER_RUN,
+                step=1,
+            )
         submitted = st.form_submit_button("Process Jobs")
 
     if submitted:
         jobs = []
         jobs.extend(parse_job_urls(job_urls))
-        for jd_text in split_raw_job_descriptions(raw_jds):
-            jobs.append(
-                {
-                    "company": "",
-                    "job_title": "",
-                    "location": "",
-                    "job_url": "",
-                    "jd_text": jd_text,
-                }
-            )
+        jobs.extend(parse_manual_jobs(raw_jds))
         if csv_upload:
             try:
                 jobs.extend(parse_csv_jobs(csv_upload))
@@ -568,25 +588,42 @@ def render_job_discovery_page() -> None:
         elif jobs_with_descriptions and not get_openai_api_key():
             st.warning("OPENAI_API_KEY is missing. Add it to your .env file before processing jobs with descriptions.")
         else:
-            processed_jobs = []
-            progress = st.progress(0)
-            for index, job in enumerate(jobs, start=1):
-                with st.spinner(f"Processing job {index} of {len(jobs)}..."):
-                    try:
-                        processed_jobs.append(
-                            process_discovered_job(
-                                job,
-                                st.session_state.user_profile,
-                                profile,
-                                career_profile_text,
-                            )
-                        )
-                    except Exception as exc:
-                        st.error(f"Could not process job {index}: {exc}")
-                progress.progress(index / len(jobs))
+            with st.spinner("Running discovery filters and LLM-limited deep analysis..."):
+                try:
+                    metrics = process_discovered_jobs(
+                        jobs,
+                        st.session_state.user_profile,
+                        profile,
+                        career_profile_text,
+                        int(pre_filter_threshold),
+                        int(max_llm_calls_per_run),
+                        int(max_jobs_per_run),
+                    )
+                except Exception as exc:
+                    st.error(f"Could not process discovered jobs: {exc}")
+                    metrics = None
 
-            if processed_jobs:
-                st.success(f"Processed {len(processed_jobs)} job(s).")
+            if metrics:
+                st.success(f"Processed {len(metrics['processed_jobs'])} job(s).")
+                metric_col1, metric_col2, metric_col3, metric_col4, metric_col5 = st.columns(5)
+                metric_col1.metric("Jobs Discovered", metrics["jobs_discovered"])
+                metric_col2.metric("Filtered Out", metrics["jobs_filtered_out"])
+                metric_col3.metric("Pre-scored", metrics["jobs_pre_scored"])
+                metric_col4.metric("Sent to LLM", metrics["jobs_sent_to_llm"])
+                metric_col5.metric("Est. Token Savings", metrics["estimated_token_savings"])
+
+                st.subheader("Imported Jobs")
+                st.dataframe(metrics["imported_jobs"], width="stretch", hide_index=True)
+
+                st.subheader("Filtered Out Jobs")
+                st.dataframe(metrics["filtered_out_jobs"], width="stretch", hide_index=True)
+
+                st.subheader("Jobs Sent to LLM")
+                sent_to_llm = metrics["jobs_sent_to_llm_rows"]
+                if sent_to_llm:
+                    st.dataframe(sent_to_llm, width="stretch", hide_index=True)
+                else:
+                    st.info("No jobs were sent to the LLM in this run.")
 
     render_job_queue()
 
@@ -601,22 +638,49 @@ def render_job_queue() -> None:
 
     display_columns = [
         "company",
-        "title",
+        "job_title",
         "location",
+        "pre_filter_score",
         "fit_score",
         "apply_decision",
-        "reason",
+        "decision_reason",
         "job_url",
         "status",
     ]
-    st.dataframe(queue[display_columns], width="stretch", hide_index=True)
+    filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
+    with filter_col1:
+        decision_filter = st.selectbox("Decision", ["All", "Apply", "Maybe", "Skip"])
+    with filter_col2:
+        minimum_fit_score = st.number_input("Minimum fit score", 0, 100, 0, 5)
+    with filter_col3:
+        company_filter = st.text_input("Company filter")
+    with filter_col4:
+        location_filter = st.text_input("Location filter")
+
+    filtered_queue = queue.copy()
+    if decision_filter != "All":
+        filtered_queue = filtered_queue[filtered_queue["apply_decision"] == decision_filter]
+    filtered_queue = filtered_queue[filtered_queue["fit_score"] >= minimum_fit_score]
+    if company_filter:
+        filtered_queue = filtered_queue[
+            filtered_queue["company"].str.contains(company_filter, case=False, na=False)
+        ]
+    if location_filter:
+        filtered_queue = filtered_queue[
+            filtered_queue["location"].str.contains(location_filter, case=False, na=False)
+        ]
+
+    st.dataframe(filtered_queue[display_columns], width="stretch", hide_index=True)
 
     st.subheader("Update Queue Status")
     with st.form("job_queue_status_form"):
         options = {
-            f"{row.company} - {row.title or 'Untitled Job'} (#{row.id})": int(row.id)
-            for row in queue.itertuples()
+            f"{row.company} - {row.job_title or 'Untitled Job'} (#{row.id})": int(row.id)
+            for row in filtered_queue.itertuples()
         }
+        if not options:
+            st.info("No jobs match the current filters.")
+            return
         selected_job = st.selectbox("Job", list(options.keys()))
         status = st.selectbox("Status", JOB_QUEUE_STATUS_OPTIONS)
         if st.form_submit_button("Update Status"):
@@ -629,13 +693,29 @@ def render_job_queue() -> None:
 
     st.header("Application Prep")
     prep_options = {
-        f"{row.company} - {row.title or 'Untitled Job'} (#{row.id})": row
+        f"{row.company} - {row.job_title or 'Untitled Job'} (#{row.id})": row
         for row in apply_jobs.itertuples()
     }
     selected_prep_label = st.selectbox("Ready-to-apply job", list(prep_options.keys()))
     selected_prep = prep_options[selected_prep_label]
 
     st.subheader("Tailored Resume Bullets")
+    if not selected_prep.resume_bullets and selected_prep.jd_text:
+        if st.button("Generate Application Prep"):
+            if not st.session_state.user_profile.strip():
+                st.warning("Add your profile/resume on the Analyze Job page before generating prep.")
+            elif not get_openai_api_key():
+                st.warning("OPENAI_API_KEY is missing. Add it to your .env file before generating prep.")
+            else:
+                with st.spinner("Generating application prep..."):
+                    prep = generate_application_prep(
+                        st.session_state.user_profile,
+                        selected_prep.jd_text,
+                        career_profile_to_text(get_career_profile()),
+                    )
+                    update_application_prep(int(selected_prep.id), prep)
+                st.success("Application prep generated. Refresh this page section to view it.")
+
     st.markdown(selected_prep.resume_bullets or "No resume bullets generated.")
 
     st.subheader("Cover Letter")

@@ -105,14 +105,18 @@ CREATE_JOB_QUEUE_TABLE = """
 CREATE TABLE IF NOT EXISTS job_queue (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     company TEXT,
+    job_title TEXT,
     title TEXT,
     location TEXT,
+    short_description TEXT,
+    source TEXT,
     required_skills TEXT,
     years_experience TEXT,
     visa_sponsorship_hints TEXT,
     application_platform TEXT,
     fit_score INTEGER,
     apply_decision TEXT,
+    decision_reason TEXT,
     reason TEXT,
     job_url TEXT,
     status TEXT,
@@ -122,7 +126,12 @@ CREATE TABLE IF NOT EXISTS job_queue (
     cover_letter TEXT,
     recruiter_message TEXT,
     application_checklist TEXT,
-    created_at TEXT
+    pre_filter_score INTEGER,
+    filter_stage TEXT,
+    filtered_out_reason TEXT,
+    sent_to_llm INTEGER,
+    created_at TEXT,
+    updated_at TEXT
 )
 """
 
@@ -157,6 +166,18 @@ APPLICATION_COLUMN_DEFAULTS = {
     "interview_stage": "TEXT",
 }
 
+JOB_QUEUE_COLUMN_DEFAULTS = {
+    "job_title": "TEXT",
+    "short_description": "TEXT",
+    "source": "TEXT",
+    "decision_reason": "TEXT",
+    "pre_filter_score": "INTEGER",
+    "filter_stage": "TEXT",
+    "filtered_out_reason": "TEXT",
+    "sent_to_llm": "INTEGER",
+    "updated_at": "TEXT",
+}
+
 
 def get_connection() -> sqlite3.Connection:
     return sqlite3.connect(DB_PATH)
@@ -171,6 +192,15 @@ def ensure_application_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE applications ADD COLUMN {column_name} {column_type}")
 
 
+def ensure_job_queue_columns(conn: sqlite3.Connection) -> None:
+    existing_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(job_queue)").fetchall()
+    }
+    for column_name, column_type in JOB_QUEUE_COLUMN_DEFAULTS.items():
+        if column_name not in existing_columns:
+            conn.execute(f"ALTER TABLE job_queue ADD COLUMN {column_name} {column_type}")
+
+
 def init_db() -> None:
     with get_connection() as conn:
         conn.execute(CREATE_USERS_TABLE)
@@ -182,6 +212,7 @@ def init_db() -> None:
         conn.execute(CREATE_MODEL_RUNS_TABLE)
         conn.execute(CREATE_USER_FEEDBACK_TABLE)
         conn.execute(CREATE_JOB_QUEUE_TABLE)
+        ensure_job_queue_columns(conn)
         conn.execute(CREATE_CAREER_PROFILE_TABLE)
         conn.execute(
             """
