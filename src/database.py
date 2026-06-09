@@ -6,6 +6,8 @@ import pandas as pd
 
 DB_PATH = Path("applications.db")
 
+DEFAULT_USER_NAME = "Default Local User"
+
 
 CREATE_APPLICATIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS applications (
@@ -19,6 +21,83 @@ CREATE TABLE IF NOT EXISTS applications (
     status TEXT,
     notes TEXT,
     created_at TEXT
+)
+"""
+
+CREATE_USERS_TABLE = """
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE,
+    created_at TEXT
+)
+"""
+
+CREATE_COMPANIES_TABLE = """
+CREATE TABLE IF NOT EXISTS companies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE,
+    created_at TEXT
+)
+"""
+
+CREATE_JOBS_TABLE = """
+CREATE TABLE IF NOT EXISTS jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_id INTEGER,
+    title TEXT,
+    location TEXT,
+    job_url TEXT,
+    job_description TEXT,
+    created_at TEXT,
+    FOREIGN KEY (company_id) REFERENCES companies(id)
+)
+"""
+
+CREATE_OUTCOMES_TABLE = """
+CREATE TABLE IF NOT EXISTS outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    application_id INTEGER,
+    outcome_status TEXT,
+    updated_at TEXT,
+    FOREIGN KEY (application_id) REFERENCES applications(id)
+)
+"""
+
+CREATE_MODEL_RUNS_TABLE = """
+CREATE TABLE IF NOT EXISTS model_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    company_id INTEGER,
+    job_id INTEGER,
+    model_name TEXT,
+    fit_score INTEGER,
+    skill_match INTEGER,
+    experience_match INTEGER,
+    domain_match INTEGER,
+    career_goal_alignment INTEGER,
+    growth_potential INTEGER,
+    missing_skills TEXT,
+    analysis_text TEXT,
+    resume_tailoring_text TEXT,
+    networking_messages_text TEXT,
+    created_at TEXT,
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (company_id) REFERENCES companies(id),
+    FOREIGN KEY (job_id) REFERENCES jobs(id)
+)
+"""
+
+CREATE_USER_FEEDBACK_TABLE = """
+CREATE TABLE IF NOT EXISTS user_feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    model_run_id INTEGER,
+    usefulness_rating INTEGER,
+    used_resume_bullets TEXT,
+    used_networking_message TEXT,
+    created_at TEXT,
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (model_run_id) REFERENCES model_runs(id)
 )
 """
 
@@ -36,6 +115,10 @@ CREATE TABLE IF NOT EXISTS career_profile (
 """
 
 APPLICATION_COLUMN_DEFAULTS = {
+    "user_id": "INTEGER",
+    "company_id": "INTEGER",
+    "job_id": "INTEGER",
+    "outcome_status": "TEXT",
     "skill_match": "INTEGER",
     "experience_match": "INTEGER",
     "domain_match": "INTEGER",
@@ -65,20 +148,35 @@ def ensure_application_columns(conn: sqlite3.Connection) -> None:
 
 def init_db() -> None:
     with get_connection() as conn:
+        conn.execute(CREATE_USERS_TABLE)
+        conn.execute(CREATE_COMPANIES_TABLE)
+        conn.execute(CREATE_JOBS_TABLE)
         conn.execute(CREATE_APPLICATIONS_TABLE)
         ensure_application_columns(conn)
+        conn.execute(CREATE_OUTCOMES_TABLE)
+        conn.execute(CREATE_MODEL_RUNS_TABLE)
+        conn.execute(CREATE_USER_FEEDBACK_TABLE)
         conn.execute(CREATE_CAREER_PROFILE_TABLE)
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO users (id, name, created_at)
+            VALUES (1, ?, datetime('now'))
+            """,
+            (DEFAULT_USER_NAME,),
+        )
         conn.commit()
 
 
 def insert_application(application: dict) -> None:
+    init_db()
     with get_connection() as conn:
-        conn.execute(CREATE_APPLICATIONS_TABLE)
-        ensure_application_columns(conn)
-        conn.execute(
+        cursor = conn.execute(
             """
             INSERT INTO applications (
                 company,
+                user_id,
+                company_id,
+                job_id,
                 job_title,
                 location,
                 job_url,
@@ -91,6 +189,7 @@ def insert_application(application: dict) -> None:
                 recommendation,
                 priority,
                 status,
+                outcome_status,
                 application_date,
                 follow_up_date,
                 recruiter_name,
@@ -99,10 +198,13 @@ def insert_application(application: dict) -> None:
                 notes,
                 created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 application["company"],
+                application["user_id"],
+                application["company_id"],
+                application["job_id"],
                 application["job_title"],
                 application["location"],
                 application["job_url"],
@@ -115,6 +217,7 @@ def insert_application(application: dict) -> None:
                 application["recommendation"],
                 application["priority"],
                 application["status"],
+                application["outcome_status"],
                 application["application_date"],
                 application["follow_up_date"],
                 application["recruiter_name"],
@@ -125,6 +228,7 @@ def insert_application(application: dict) -> None:
             ),
         )
         conn.commit()
+        return cursor.lastrowid
 
 
 def fetch_applications() -> pd.DataFrame:
@@ -135,6 +239,9 @@ def fetch_applications() -> pd.DataFrame:
             SELECT
                 id,
                 company,
+                user_id,
+                company_id,
+                job_id,
                 job_title,
                 location,
                 job_url,
@@ -147,6 +254,7 @@ def fetch_applications() -> pd.DataFrame:
                 recommendation,
                 priority,
                 status,
+                outcome_status,
                 application_date,
                 follow_up_date,
                 recruiter_name,

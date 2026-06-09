@@ -3,6 +3,19 @@ import re
 import streamlit as st
 from dotenv import load_dotenv
 
+from src.data_collection import (
+    OUTCOME_STATUS_OPTIONS,
+    create_job,
+    create_outcome,
+    fetch_analytics_summary,
+    fetch_average_fit_score_by_outcome,
+    fetch_most_common_missing_skills,
+    fetch_top_scoring_companies,
+    get_or_create_company,
+    record_analysis_run,
+    save_user_feedback,
+    update_outcome,
+)
 from src.file_parser import extract_text_from_uploaded_file
 from src.job_analyzer import analyze_job
 from src.llm import get_openai_api_key
@@ -65,6 +78,14 @@ def initialize_session_state() -> None:
         "score_breakdown": {},
         "computed_fit_score": 0,
         "priority": "",
+        "analysis_company": "",
+        "analysis_job_title": "",
+        "analysis_location": "",
+        "analysis_job_url": "",
+        "analysis_user_id": 1,
+        "analysis_company_id": 0,
+        "analysis_job_id": 0,
+        "analysis_model_run_id": 0,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -144,6 +165,15 @@ def render_analysis_page() -> None:
     )
 
     st.header("Job Description")
+    st.subheader("Job Metadata")
+    meta_col1, meta_col2 = st.columns(2)
+    with meta_col1:
+        st.text_input("Company", key="analysis_company")
+        st.text_input("Job title", key="analysis_job_title")
+    with meta_col2:
+        st.text_input("Location", key="analysis_location")
+        st.text_input("Job URL", key="analysis_job_url")
+
     jd_upload = st.file_uploader(
         "Upload the job description",
         type=["pdf", "docx", "txt"],
@@ -193,6 +223,22 @@ def render_analysis_page() -> None:
                         st.session_state.job_description,
                         career_profile_text,
                     )
+                data_links = record_analysis_run(
+                    st.session_state.analysis_company,
+                    st.session_state.analysis_job_title,
+                    st.session_state.analysis_location,
+                    st.session_state.analysis_job_url,
+                    st.session_state.job_description,
+                    st.session_state.computed_fit_score,
+                    st.session_state.score_breakdown,
+                    st.session_state.analysis,
+                    st.session_state.resume_tailoring,
+                    st.session_state.networking_messages,
+                )
+                st.session_state.analysis_user_id = data_links["user_id"]
+                st.session_state.analysis_company_id = data_links["company_id"]
+                st.session_state.analysis_job_id = data_links["job_id"]
+                st.session_state.analysis_model_run_id = data_links["model_run_id"]
             except Exception as exc:
                 st.error(f"LLM call failed: {exc}")
 
@@ -223,7 +269,55 @@ def render_analysis_page() -> None:
             mime="text/plain",
         )
 
+    render_feedback_form()
     render_save_application_form()
+
+
+def render_feedback_form() -> None:
+    if not st.session_state.analysis_model_run_id:
+        return
+
+    st.header("Analysis Feedback")
+    with st.form("analysis_feedback_form"):
+        usefulness_rating = st.slider("Was this analysis useful?", 1, 5, 4)
+        used_resume_bullets = st.radio(
+            "Did you use the generated resume bullets?",
+            ["yes", "no"],
+            horizontal=True,
+        )
+        used_networking_message = st.radio(
+            "Did you use the networking message?",
+            ["yes", "no"],
+            horizontal=True,
+        )
+
+        if st.form_submit_button("Save Feedback"):
+            save_user_feedback(
+                st.session_state.analysis_model_run_id,
+                usefulness_rating,
+                used_resume_bullets,
+                used_networking_message,
+            )
+            st.success("Feedback saved.")
+
+
+def ensure_application_links(company: str, job_title: str, location: str, job_url: str) -> dict:
+    if st.session_state.analysis_company_id and st.session_state.analysis_job_id:
+        return {
+            "user_id": st.session_state.analysis_user_id,
+            "company_id": st.session_state.analysis_company_id,
+            "job_id": st.session_state.analysis_job_id,
+        }
+
+    company_id = get_or_create_company(company)
+    job_id = create_job(
+        company_id,
+        job_title,
+        location,
+        job_url,
+        st.session_state.job_description,
+    )
+    return {"user_id": 1, "company_id": company_id, "job_id": job_id}
 
 
 def render_save_application_form() -> None:
@@ -231,12 +325,32 @@ def render_save_application_form() -> None:
     with st.form("save_application_form"):
         col1, col2 = st.columns(2)
         with col1:
-            company = st.text_input("Company")
-            job_title = st.text_input("Job title")
-            location = st.text_input("Location")
-            job_url = st.text_input("Job URL")
-            recruiter_name = st.text_input("Recruiter Name")
-            application_date = st.text_input("Application Date", placeholder="YYYY-MM-DD")
+            company = st.text_input(
+                "Company",
+                value=st.session_state.analysis_company,
+                key="save_company",
+            )
+            job_title = st.text_input(
+                "Job title",
+                value=st.session_state.analysis_job_title,
+                key="save_job_title",
+            )
+            location = st.text_input(
+                "Location",
+                value=st.session_state.analysis_location,
+                key="save_location",
+            )
+            job_url = st.text_input(
+                "Job URL",
+                value=st.session_state.analysis_job_url,
+                key="save_job_url",
+            )
+            recruiter_name = st.text_input("Recruiter Name", key="save_recruiter_name")
+            application_date = st.text_input(
+                "Application Date",
+                placeholder="YYYY-MM-DD",
+                key="save_application_date",
+            )
         with col2:
             inferred_fit_score = st.session_state.computed_fit_score
             inferred_recommendation = extract_recommendation(st.session_state.analysis)
@@ -265,14 +379,20 @@ def render_save_application_form() -> None:
                 else 0,
             )
             status = st.selectbox("Status", STATUS_OPTIONS)
-            follow_up_date = st.text_input("Follow-up Date", placeholder="YYYY-MM-DD")
-            interview_stage = st.text_input("Interview Stage")
-        next_action = st.text_input("Next Action")
-        notes = st.text_area("Notes", height=120)
+            outcome_status = st.selectbox("Outcome Status", OUTCOME_STATUS_OPTIONS)
+            follow_up_date = st.text_input(
+                "Follow-up Date",
+                placeholder="YYYY-MM-DD",
+                key="save_follow_up_date",
+            )
+            interview_stage = st.text_input("Interview Stage", key="save_interview_stage")
+        next_action = st.text_input("Next Action", key="save_next_action")
+        notes = st.text_area("Notes", height=120, key="save_notes")
 
         submitted = st.form_submit_button("Save Application")
         if submitted:
-            save_application(
+            links = ensure_application_links(company, job_title, location, job_url)
+            application_id = save_application(
                 company=company,
                 job_title=job_title,
                 location=location,
@@ -288,7 +408,12 @@ def render_save_application_form() -> None:
                 recruiter_name=recruiter_name,
                 next_action=next_action,
                 interview_stage=interview_stage,
+                user_id=links["user_id"],
+                company_id=links["company_id"],
+                job_id=links["job_id"],
+                outcome_status=outcome_status,
             )
+            create_outcome(application_id, outcome_status)
             st.success("Application saved.")
 
 
@@ -332,14 +457,65 @@ def render_tracker_page() -> None:
 
     st.dataframe(applications, width="stretch", hide_index=True)
 
+    if applications.empty:
+        return
+
+    st.subheader("Update Outcome")
+    with st.form("outcome_update_form"):
+        application_options = {
+            f"{row.company} - {row.job_title} (#{row.id})": int(row.id)
+            for row in applications.itertuples()
+        }
+        selected_application = st.selectbox(
+            "Application",
+            list(application_options.keys()),
+        )
+        outcome_status = st.selectbox("Outcome Status", OUTCOME_STATUS_OPTIONS)
+        if st.form_submit_button("Update Outcome"):
+            update_outcome(application_options[selected_application], outcome_status)
+            st.success("Outcome updated.")
+
+
+def render_analytics_page() -> None:
+    st.header("Analytics")
+    summary = fetch_analytics_summary()
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Analyzed Jobs", summary["total_analyzed_jobs"])
+    col2.metric("Total Applications", summary["total_applications"])
+    col3.metric("Interview Rate", f"{summary['interview_rate']:.1%}")
+    col4.metric("Offer Rate", f"{summary['offer_rate']:.1%}")
+
+    st.subheader("Average Fit Score By Outcome")
+    outcome_scores = fetch_average_fit_score_by_outcome()
+    st.dataframe(outcome_scores, width="stretch", hide_index=True)
+    if not outcome_scores.empty:
+        st.bar_chart(outcome_scores.set_index("outcome")["average_fit_score"])
+
+    st.subheader("Most Common Missing Skills")
+    missing_skills = fetch_most_common_missing_skills()
+    st.dataframe(missing_skills, width="stretch", hide_index=True)
+    if not missing_skills.empty:
+        st.bar_chart(missing_skills.set_index("missing_skill")["count"])
+
+    st.subheader("Top Scoring Companies")
+    top_companies = fetch_top_scoring_companies()
+    st.dataframe(top_companies, width="stretch", hide_index=True)
+    if not top_companies.empty:
+        st.bar_chart(top_companies.set_index("company")["average_fit_score"])
+
 
 initialize_session_state()
 
 st.title("AI Job Search Copilot")
 
+st.info(
+    "MVP note: Data is stored locally in SQLite. User data is only sent to the LLM API for analysis. No multi-user login yet."
+)
+
 page = st.sidebar.radio(
     "Page",
-    ["Analyze Job", "Setup", "Job Pipeline", "Application Tracker"],
+    ["Analyze Job", "Setup", "Job Pipeline", "Application Tracker", "Analytics"],
 )
 
 if page == "Setup":
@@ -348,5 +524,7 @@ elif page == "Job Pipeline":
     render_pipeline_page()
 elif page == "Application Tracker":
     render_tracker_page()
+elif page == "Analytics":
+    render_analytics_page()
 else:
     render_analysis_page()

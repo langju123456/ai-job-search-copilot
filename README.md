@@ -21,6 +21,9 @@ Job seekers often spend too much time deciding whether a role is worth applying 
 - Prioritize saved jobs into Must Apply, Good Opportunity, and Low Priority buckets
 - Track CRM-style fields such as recruiter name, follow-up date, next action, and interview stage
 - Export resume suggestions and networking messages as `.txt` files
+- Store local data collection records for users, companies, jobs, model runs, outcomes, and feedback
+- Update application outcomes and capture lightweight analysis feedback
+- View analytics for analyzed jobs, applications, interview rate, offer rate, missing skills, and top scoring companies
 
 ## Tech Stack
 
@@ -42,6 +45,11 @@ Job seekers often spend too much time deciding whether a role is worth applying 
 - `src/tracker.py` provides application tracking helpers
 - `src/scoring.py` parses structured score components and computes priority
 - `src/profile.py` reads and writes career profile memory
+- `src/data_collection.py` records local learning data and analytics queries
+
+## MVP Data Note
+
+Data is stored locally in SQLite. User data is only sent to the configured LLM API for analysis. There is no multi-user login or authentication in this MVP.
 
 ## How To Run Locally
 

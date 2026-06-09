@@ -23,11 +23,18 @@ def save_application(
     recruiter_name: str = "",
     next_action: str = "",
     interview_stage: str = "",
-) -> None:
+    user_id: int = 1,
+    company_id: int = 0,
+    job_id: int = 0,
+    outcome_status: str = "No Response",
+) -> int:
     score_breakdown = score_breakdown or {}
-    insert_application(
+    return insert_application(
         {
             "company": company,
+            "user_id": user_id,
+            "company_id": company_id,
+            "job_id": job_id,
             "job_title": job_title,
             "location": location,
             "job_url": job_url,
@@ -40,6 +47,7 @@ def save_application(
             "recommendation": recommendation,
             "priority": priority,
             "status": status,
+            "outcome_status": outcome_status,
             "application_date": application_date,
             "follow_up_date": follow_up_date,
             "recruiter_name": recruiter_name,
