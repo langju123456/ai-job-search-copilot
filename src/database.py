@@ -144,10 +144,12 @@ CREATE_CAREER_PROFILE_TABLE = """
 CREATE TABLE IF NOT EXISTS career_profile (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     name TEXT,
+    headline TEXT,
     summary TEXT,
     education TEXT,
     skills TEXT,
     target_roles TEXT,
+    acceptable_roles TEXT,
     preferred_locations TEXT,
     excluded_roles TEXT,
     visa_status TEXT,
@@ -159,6 +161,65 @@ CREATE TABLE IF NOT EXISTS career_profile (
     suggested_career_paths TEXT,
     generated_at TEXT,
     updated_at TEXT
+)
+"""
+
+CREATE_SKILLS_TABLE = """
+CREATE TABLE IF NOT EXISTS skills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category TEXT,
+    skill_name TEXT,
+    proficiency TEXT,
+    evidence TEXT,
+    updated_at TEXT
+)
+"""
+
+CREATE_PROJECTS_TABLE = """
+CREATE TABLE IF NOT EXISTS projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_name TEXT,
+    project_type TEXT,
+    business_problem TEXT,
+    technical_stack TEXT,
+    ai_methods TEXT,
+    business_impact TEXT,
+    target_roles_supported TEXT,
+    resume_bullets TEXT,
+    updated_at TEXT
+)
+"""
+
+CREATE_PREFERENCES_TABLE = """
+CREATE TABLE IF NOT EXISTS preferences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    preference_type TEXT,
+    preference_value TEXT,
+    weight TEXT,
+    updated_at TEXT
+)
+"""
+
+CREATE_CONSTRAINTS_TABLE = """
+CREATE TABLE IF NOT EXISTS constraints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    constraint_type TEXT,
+    constraint_value TEXT,
+    severity TEXT,
+    updated_at TEXT
+)
+"""
+
+CREATE_CAREER_FEEDBACK_TABLE = """
+CREATE TABLE IF NOT EXISTS career_feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER,
+    user_decision TEXT,
+    agent_decision TEXT,
+    outcome TEXT,
+    user_rating INTEGER,
+    notes TEXT,
+    created_at TEXT
 )
 """
 
@@ -226,13 +287,16 @@ JOB_QUEUE_COLUMN_DEFAULTS = {
 }
 
 CAREER_PROFILE_COLUMN_DEFAULTS = {
+    "headline": "TEXT",
     "summary": "TEXT",
     "education": "TEXT",
     "skills": "TEXT",
+    "acceptable_roles": "TEXT",
     "preferred_locations": "TEXT",
     "excluded_roles": "TEXT",
     "salary_goal": "TEXT",
     "career_goal": "TEXT",
+    "years_experience": "TEXT",
     "missing_skills": "TEXT",
     "suggested_locations": "TEXT",
     "suggested_career_paths": "TEXT",
@@ -286,6 +350,11 @@ def init_db() -> None:
         ensure_job_queue_columns(conn)
         conn.execute(CREATE_CAREER_PROFILE_TABLE)
         ensure_career_profile_columns(conn)
+        conn.execute(CREATE_SKILLS_TABLE)
+        conn.execute(CREATE_PROJECTS_TABLE)
+        conn.execute(CREATE_PREFERENCES_TABLE)
+        conn.execute(CREATE_CONSTRAINTS_TABLE)
+        conn.execute(CREATE_CAREER_FEEDBACK_TABLE)
         conn.execute(CREATE_JOB_DISCOVERY_RUNS_TABLE)
         conn.execute(CREATE_DISCOVERED_SOURCES_TABLE)
         conn.execute(
@@ -417,10 +486,12 @@ def upsert_career_profile(profile: dict) -> None:
             INSERT INTO career_profile (
                 id,
                 name,
+                headline,
                 summary,
                 education,
                 skills,
                 target_roles,
+                acceptable_roles,
                 preferred_locations,
                 excluded_roles,
                 visa_status,
@@ -433,13 +504,15 @@ def upsert_career_profile(profile: dict) -> None:
                 generated_at,
                 updated_at
             )
-            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
+                headline = excluded.headline,
                 summary = excluded.summary,
                 education = excluded.education,
                 skills = excluded.skills,
                 target_roles = excluded.target_roles,
+                acceptable_roles = excluded.acceptable_roles,
                 preferred_locations = excluded.preferred_locations,
                 excluded_roles = excluded.excluded_roles,
                 visa_status = excluded.visa_status,
@@ -454,10 +527,12 @@ def upsert_career_profile(profile: dict) -> None:
             """,
             (
                 profile.get("name", ""),
+                profile.get("headline", ""),
                 profile.get("summary", ""),
                 profile.get("education", ""),
                 profile.get("skills", ""),
                 profile.get("target_roles", ""),
+                profile.get("acceptable_roles", ""),
                 profile.get("preferred_locations", ""),
                 profile.get("excluded_roles", ""),
                 profile.get("visa_status", ""),
@@ -481,10 +556,12 @@ def fetch_career_profile() -> dict:
             """
             SELECT
                 name,
+                headline,
                 summary,
                 education,
                 skills,
                 target_roles,
+                acceptable_roles,
                 preferred_locations,
                 excluded_roles,
                 visa_status,
@@ -504,10 +581,12 @@ def fetch_career_profile() -> dict:
     if not row:
         return {
             "name": "",
+            "headline": "",
             "summary": "",
             "education": "",
             "skills": "",
             "target_roles": "",
+            "acceptable_roles": "",
             "preferred_locations": "",
             "excluded_roles": "",
             "visa_status": "",
@@ -523,19 +602,159 @@ def fetch_career_profile() -> dict:
 
     return {
         "name": row[0] or "",
-        "summary": row[1] or "",
-        "education": row[2] or "",
-        "skills": row[3] or "",
-        "target_roles": row[4] or "",
-        "preferred_locations": row[5] or "",
-        "excluded_roles": row[6] or "",
-        "visa_status": row[7] or "",
-        "salary_goal": row[8] or "",
-        "years_experience": row[9] or "",
-        "career_goal": row[10] or "",
-        "missing_skills": row[11] or "",
-        "suggested_locations": row[12] or "",
-        "suggested_career_paths": row[13] or "",
-        "generated_at": row[14] or "",
-        "updated_at": row[15] or "",
+        "headline": row[1] or "",
+        "summary": row[2] or "",
+        "education": row[3] or "",
+        "skills": row[4] or "",
+        "target_roles": row[5] or "",
+        "acceptable_roles": row[6] or "",
+        "preferred_locations": row[7] or "",
+        "excluded_roles": row[8] or "",
+        "visa_status": row[9] or "",
+        "salary_goal": row[10] or "",
+        "years_experience": row[11] or "",
+        "career_goal": row[12] or "",
+        "missing_skills": row[13] or "",
+        "suggested_locations": row[14] or "",
+        "suggested_career_paths": row[15] or "",
+        "generated_at": row[16] or "",
+        "updated_at": row[17] or "",
     }
+
+
+def replace_table_rows(table_name: str, columns: list[str], rows: list[dict]) -> None:
+    init_db()
+    timestamp = pd.Timestamp.utcnow().isoformat()
+    with get_connection() as conn:
+        conn.execute(f"DELETE FROM {table_name}")
+        if rows:
+            placeholders = ", ".join(["?"] * len(columns))
+            column_sql = ", ".join(columns)
+            values = []
+            for row in rows:
+                row_values = []
+                for column in columns:
+                    if column == "updated_at":
+                        row_values.append(row.get(column) or timestamp)
+                    else:
+                        row_values.append(str(row.get(column, "") or ""))
+                values.append(tuple(row_values))
+            conn.executemany(
+                f"INSERT INTO {table_name} ({column_sql}) VALUES ({placeholders})",
+                values,
+            )
+        conn.commit()
+
+
+def fetch_table_rows(table_name: str, columns: list[str]) -> list[dict]:
+    init_db()
+    with get_connection() as conn:
+        rows = conn.execute(f"SELECT {', '.join(columns)} FROM {table_name} ORDER BY id").fetchall()
+    return [
+        {
+            column: value if value is not None else ""
+            for column, value in zip(columns, row)
+        }
+        for row in rows
+    ]
+
+
+def replace_skills(rows: list[dict]) -> None:
+    replace_table_rows(
+        "skills",
+        ["category", "skill_name", "proficiency", "evidence", "updated_at"],
+        rows,
+    )
+
+
+def fetch_skills() -> list[dict]:
+    return fetch_table_rows(
+        "skills",
+        ["category", "skill_name", "proficiency", "evidence", "updated_at"],
+    )
+
+
+def replace_projects(rows: list[dict]) -> None:
+    replace_table_rows(
+        "projects",
+        [
+            "project_name",
+            "project_type",
+            "business_problem",
+            "technical_stack",
+            "ai_methods",
+            "business_impact",
+            "target_roles_supported",
+            "resume_bullets",
+            "updated_at",
+        ],
+        rows,
+    )
+
+
+def fetch_projects() -> list[dict]:
+    return fetch_table_rows(
+        "projects",
+        [
+            "project_name",
+            "project_type",
+            "business_problem",
+            "technical_stack",
+            "ai_methods",
+            "business_impact",
+            "target_roles_supported",
+            "resume_bullets",
+            "updated_at",
+        ],
+    )
+
+
+def replace_preferences(rows: list[dict]) -> None:
+    replace_table_rows(
+        "preferences",
+        ["preference_type", "preference_value", "weight", "updated_at"],
+        rows,
+    )
+
+
+def fetch_preferences() -> list[dict]:
+    return fetch_table_rows(
+        "preferences",
+        ["preference_type", "preference_value", "weight", "updated_at"],
+    )
+
+
+def replace_constraints(rows: list[dict]) -> None:
+    replace_table_rows(
+        "constraints",
+        ["constraint_type", "constraint_value", "severity", "updated_at"],
+        rows,
+    )
+
+
+def fetch_constraints() -> list[dict]:
+    return fetch_table_rows(
+        "constraints",
+        ["constraint_type", "constraint_value", "severity", "updated_at"],
+    )
+
+
+def fetch_career_feedback() -> pd.DataFrame:
+    init_db()
+    with get_connection() as conn:
+        return pd.read_sql_query(
+            """
+            SELECT
+                id,
+                job_id,
+                user_decision,
+                agent_decision,
+                outcome,
+                user_rating,
+                notes,
+                created_at
+            FROM career_feedback
+            ORDER BY created_at DESC, id DESC
+            """,
+            conn,
+        )

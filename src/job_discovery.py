@@ -10,7 +10,13 @@ from src.database import get_connection, init_db
 from src.job_analyzer import analyze_job
 from src.llm import call_llm
 from src.resume_tailor import tailor_resume
-from src.scoring import parse_score_breakdown
+from src.scoring import (
+    compact_career_profile_text,
+    parse_score_breakdown,
+    select_relevant_projects,
+    split_terms,
+    top_skills,
+)
 
 
 JOB_QUEUE_STATUS_OPTIONS = [
@@ -540,17 +546,23 @@ def should_filter_job(job: dict, settings: dict) -> dict:
     career_profile = settings.get("career_profile", {}) or {}
     job_level = job.get("job_level", "Unknown")
 
-    excluded_roles = [
-        role.strip().lower()
-        for role in re.split(r"[,;]", career_profile.get("excluded_roles", ""))
-        if role.strip()
-    ]
+    excluded_roles = [role.lower() for role in split_terms(career_profile.get("excluded_roles", ""))]
     for role in excluded_roles:
         if role and role in text:
             return {
                 "filtered": True,
                 "category": "Filtered",
                 "reason": f"Filtered by excluded role: {role}",
+            }
+
+    preferred_locations = [location.lower() for location in split_terms(career_profile.get("preferred_locations", ""))]
+    location_text = job.get("location", "").lower()
+    if preferred_locations and location_text and "remote" not in location_text:
+        if not any(location in location_text for location in preferred_locations):
+            return {
+                "filtered": True,
+                "category": "Filtered",
+                "reason": "Filtered by preferred location mismatch",
             }
 
     for keyword in HARD_NEGATIVE_KEYWORDS:
@@ -724,10 +736,14 @@ def rule_based_filter(job: dict, career_profile: dict, allow_senior_roles: bool 
     title = job.get("job_title", "").lower()
     location = job.get("location", "").lower()
     preferred_locations = career_profile.get("preferred_locations", "").lower()
+    excluded_roles = [role.lower() for role in split_terms(career_profile.get("excluded_roles", ""))]
 
     for keyword in HARD_NEGATIVE_KEYWORDS:
         if keyword in text:
             return {"passed": False, "reason": f"Filtered out by keyword: {keyword}"}
+
+    if any(role in text for role in excluded_roles):
+        return {"passed": False, "reason": "Filtered out by excluded role"}
 
     if not allow_senior_roles and any(keyword in title for keyword in ["staff", "principal", "director", "vp"]):
         return {"passed": False, "reason": "Filtered out by seniority"}
@@ -747,12 +763,17 @@ def rule_based_filter(job: dict, career_profile: dict, allow_senior_roles: bool 
 def keyword_pre_score(job: dict, career_profile: dict) -> int:
     text = combined_text(job)
     title = job.get("job_title", "").lower()
-    target_roles = career_profile.get("target_roles", "").lower()
+    target_roles = career_profile.get("target_roles", "")
+    acceptable_roles = career_profile.get("acceptable_roles", "")
+    preferred_locations = career_profile.get("preferred_locations", "").lower()
     score = 0
 
-    target_role_terms = [role.strip() for role in target_roles.split(",") if role.strip()]
+    target_role_terms = [role.lower() for role in split_terms(target_roles)]
     if target_role_terms and any(role in title for role in target_role_terms):
         score += 25
+    acceptable_role_terms = [role.lower() for role in split_terms(acceptable_roles)]
+    if acceptable_role_terms and any(role in title for role in acceptable_role_terms):
+        score += 12
 
     if any(keyword in text for keyword in ["llm", "genai", "generative ai", "agent", "rag"]):
         score += 20
@@ -763,6 +784,17 @@ def keyword_pre_score(job: dict, career_profile: dict) -> int:
     if any(keyword in text for keyword in ["solutions engineer", "sales engineer"]):
         if "ai" in text or "saas" in text:
             score += 10
+    if preferred_locations and (
+        "remote" in preferred_locations
+        and ("remote" in text or "hybrid" in text)
+    ):
+        score += 5
+
+    profile_skills = [skill.lower() for skill in top_skills(career_profile, limit=12)]
+    score += min(
+        15,
+        3 * sum(1 for skill in profile_skills if skill and skill in text),
+    )
 
     if any(keyword in title for keyword in ["staff", "principal", "director", "vp"]):
         score -= 30
@@ -794,6 +826,8 @@ def compressed_job_text(job: dict) -> str:
 Company: {job.get("company", "")}
 Job title: {job.get("job_title", "")}
 Location: {job.get("location", "")}
+Job level: {job.get("job_level", "Unknown")}
+Work mode: {job.get("work_mode", "Unknown")}
 Short description: {job.get("short_description", "")}
 Relevant JD lines:
 {top_relevant_keyword_lines(job.get("jd_text", ""))}
@@ -844,13 +878,42 @@ def decide_apply(fit_score: int, missing_skills: list, job: dict, career_profile
     if decision == "Apply" and len(missing_skills) >= 5:
         decision = "Maybe"
 
+    role_hits = []
+    for label, raw_value in [
+        ("target roles", career_profile.get("target_roles", "")),
+        ("acceptable roles", career_profile.get("acceptable_roles", "")),
+    ]:
+        hits = [role for role in split_terms(raw_value) if role.lower() in text]
+        if hits:
+            role_hits.append(f"{label}: {', '.join(hits[:3])}")
+
+    relevant_projects = select_relevant_projects(career_profile, text, limit=2)
+    project_names = [project.get("project_name", "") for project in relevant_projects if project.get("project_name")]
+    active_constraints = [
+        row
+        for row in (career_profile.get("constraints", []) or [])
+        if row.get("constraint_type") or row.get("constraint_value")
+    ]
+
     reason = [
         f"fit score {fit_score}",
         "visa risk present" if visa_risk else "no clear visa blocker",
         "portfolio alignment present" if portfolio_alignment else "portfolio alignment unclear",
     ]
+    if role_hits:
+        reason.append("; ".join(role_hits))
+    if project_names:
+        reason.append(f"supporting projects: {', '.join(project_names)}")
     if missing_skills:
         reason.append(f"missing skills: {', '.join(missing_skills[:3])}")
+    if active_constraints:
+        reason.append(
+            "constraints considered: "
+            + ", ".join(
+                row.get("constraint_type", "") or row.get("constraint_value", "")
+                for row in active_constraints[:2]
+            )
+        )
     return {"apply_decision": decision, "decision_reason": "; ".join(reason)}
 
 
@@ -1022,7 +1085,8 @@ def evaluate_job_without_llm(
 
 
 def evaluate_job_with_llm(job: dict, item: dict, user_profile: str, career_profile: dict, career_profile_text: str) -> dict:
-    analysis = analyze_job(user_profile, compressed_job_text(job), career_profile_text)
+    compact_profile = compact_career_profile_text(career_profile, combined_text(job))
+    analysis = analyze_job(compact_profile or career_profile_text or user_profile, compressed_job_text(job), compact_profile or career_profile_text)
     score_breakdown = parse_score_breakdown(analysis)
     fit_score = score_breakdown["fit_score"]
     missing_skills = extract_missing_skills_from_analysis(analysis)

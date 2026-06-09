@@ -13,6 +13,17 @@ Evaluate relative to the user's actual background, skills, goals, constraints,
 target roles, location preferences, seniority fit, and missing skills. Do not
 score a job highly just because the job is generally strong.
 
+The fit score must reflect:
+- target role match
+- acceptable role adjacency
+- excluded role penalties
+- skills overlap
+- project evidence
+- location preference
+- visa constraint
+- seniority match
+- career goal alignment
+
 Do not give generic advice. Be specific, direct, structured, and easy to copy.
 """
 
@@ -64,7 +75,10 @@ Return the analysis using exactly these sections:
 
 ## Fit Reasoning
 - Target role alignment: [specific reasoning]
+- Acceptable vs excluded roles: [specific reasoning]
 - Skills overlap: [specific reasoning]
+- Project evidence: [specific reasoning]
+- Constraints and location: [specific reasoning]
 - Missing skills impact: [specific reasoning]
 - Location and seniority fit: [specific reasoning]
 - AI relevance and growth potential: [specific reasoning]

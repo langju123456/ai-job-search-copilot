@@ -41,11 +41,13 @@ from src.llm import get_openai_api_key
 from src.networking import generate_networking_messages
 from src.profile import (
     generate_career_profile_from_resume,
+    get_career_feedback_history,
     get_career_profile,
     save_career_profile,
 )
 from src.resume_tailor import tailor_resume
 from src.scoring import (
+    compact_career_profile_text,
     career_profile_to_text,
     determine_priority,
     parse_score_breakdown,
@@ -116,6 +118,26 @@ def initialize_session_state() -> None:
             st.session_state[key] = value
 
 
+def text_to_rows(text: str, row_key: str) -> list[dict]:
+    rows = []
+    for line in (text or "").splitlines():
+        value = line.strip()
+        if value:
+            rows.append({row_key: value})
+    return rows
+
+
+def dataframe_editor_rows(dataframe: pd.DataFrame) -> list[dict]:
+    cleaned_df = dataframe.fillna("")
+    if cleaned_df.empty:
+        return []
+    rows = []
+    for row in cleaned_df.to_dict("records"):
+        if any(str(value).strip() for value in row.values()):
+            rows.append({key: str(value).strip() for key, value in row.items()})
+    return rows
+
+
 def render_setup_page() -> None:
     st.header("Career Profile Setup")
     profile = get_career_profile()
@@ -163,10 +185,12 @@ def render_career_profile_summary(profile: dict) -> None:
 
     card_col1, card_col2 = st.columns(2)
     with card_col1:
+        st.markdown(f"**Headline**\n\n{profile.get('headline', '') or profile.get('summary', '') or 'Not set'}")
         st.markdown(f"**Target Roles**\n\n{profile.get('target_roles', '') or 'Not set'}")
         st.markdown(f"**Top Skills**\n\n{profile.get('skills', '') or 'Not set'}")
         st.markdown(f"**Visa Status**\n\n{profile.get('visa_status', '') or 'Not set'}")
     with card_col2:
+        st.markdown(f"**Acceptable Roles**\n\n{profile.get('acceptable_roles', '') or 'Not set'}")
         st.markdown(f"**Missing Skills**\n\n{profile.get('missing_skills', '') or 'Not set'}")
         st.markdown(f"**Preferred Locations**\n\n{profile.get('preferred_locations', '') or profile.get('suggested_locations', '') or 'Not set'}")
         st.markdown(f"**Years Experience**\n\n{profile.get('years_experience', '') or 'Not set'}")
@@ -174,7 +198,7 @@ def render_career_profile_summary(profile: dict) -> None:
 
 def render_career_profile_page() -> None:
     st.header("Career Profile")
-    st.caption("Generate a user-centric career profile from your resume before running job discovery.")
+    st.caption("Generate and edit the structured profile that powers job discovery, fit scoring, and application prep.")
 
     profile_upload = st.file_uploader(
         "Upload resume",
@@ -189,7 +213,7 @@ def render_career_profile_page() -> None:
         height=260,
     )
 
-    if st.button("Generate Career Profile", type="primary"):
+    if st.button("Generate Structured Profile from Resume", type="primary"):
         resume_text = st.session_state.get("career_profile_resume_text", "").strip()
         if not resume_text:
             st.warning("Upload or paste your resume before generating a career profile.")
@@ -209,23 +233,173 @@ def render_career_profile_page() -> None:
     render_career_profile_summary(saved_profile)
 
     if any(saved_profile.values()):
-        st.subheader("Structured Profile")
-        profile_sections = [
-            ("Professional Summary", "summary"),
-            ("Education", "education"),
-            ("Skill Inventory", "skills"),
-            ("Suggested Target Roles", "target_roles"),
-            ("Suggested Locations", "suggested_locations"),
-            ("Preferred Locations", "preferred_locations"),
-            ("Missing Skills", "missing_skills"),
-            ("Suggested Career Paths", "suggested_career_paths"),
-            ("Excluded Roles", "excluded_roles"),
-        ]
-        for label, key in profile_sections:
-            value = saved_profile.get(key, "")
-            if value:
-                st.markdown(f"**{label}**")
-                st.write(value)
+        with st.form("career_profile_core_form"):
+            st.subheader("Core Profile")
+            core_col1, core_col2 = st.columns(2)
+            with core_col1:
+                name = st.text_input("Name", value=saved_profile.get("name", ""))
+                headline = st.text_input("Headline", value=saved_profile.get("headline", ""))
+                visa_status = st.text_input("Visa status", value=saved_profile.get("visa_status", ""))
+                years_experience = st.text_input(
+                    "Years experience",
+                    value=saved_profile.get("years_experience", ""),
+                )
+                preferred_locations = st.text_area(
+                    "Preferred locations",
+                    value=saved_profile.get("preferred_locations", ""),
+                    height=90,
+                )
+            with core_col2:
+                target_roles = st.text_area(
+                    "Target roles",
+                    value=saved_profile.get("target_roles", ""),
+                    height=90,
+                )
+                acceptable_roles = st.text_area(
+                    "Acceptable roles",
+                    value=saved_profile.get("acceptable_roles", ""),
+                    height=90,
+                )
+                excluded_roles = st.text_area(
+                    "Excluded roles",
+                    value=saved_profile.get("excluded_roles", ""),
+                    height=90,
+                )
+                salary_goal = st.text_input("Salary goal", value=saved_profile.get("salary_goal", ""))
+
+            summary = st.text_area(
+                "Professional summary",
+                value=saved_profile.get("summary", ""),
+                height=120,
+            )
+            education = st.text_area(
+                "Education",
+                value=saved_profile.get("education", ""),
+                height=100,
+            )
+            career_goal = st.text_area(
+                "Career goal",
+                value=saved_profile.get("career_goal", ""),
+                height=100,
+            )
+            missing_skills = st.text_area(
+                "Missing skills",
+                value=saved_profile.get("missing_skills", ""),
+                height=90,
+            )
+            if st.form_submit_button("Save Core Profile"):
+                updated_profile = {
+                    **saved_profile,
+                    "name": name,
+                    "headline": headline,
+                    "summary": summary,
+                    "education": education,
+                    "target_roles": target_roles,
+                    "acceptable_roles": acceptable_roles,
+                    "preferred_locations": preferred_locations,
+                    "excluded_roles": excluded_roles,
+                    "visa_status": visa_status,
+                    "salary_goal": salary_goal,
+                    "years_experience": years_experience,
+                    "career_goal": career_goal,
+                    "missing_skills": missing_skills,
+                }
+                save_career_profile(updated_profile)
+                st.success("Core profile saved.")
+                st.rerun()
+
+        st.subheader("Skill Graph")
+        skills_df = pd.DataFrame(
+            saved_profile.get("skills_inventory", []),
+            columns=["category", "skill_name", "proficiency", "evidence"],
+        )
+        edited_skills = st.data_editor(
+            skills_df,
+            num_rows="dynamic",
+            width="stretch",
+            key="career_profile_skills_editor",
+        )
+        if st.button("Save Skills"):
+            updated_profile = {**saved_profile, "skills_inventory": dataframe_editor_rows(edited_skills)}
+            save_career_profile(updated_profile)
+            st.success("Skills saved.")
+            st.rerun()
+
+        st.subheader("Project Memory")
+        projects_df = pd.DataFrame(
+            saved_profile.get("projects", []),
+            columns=[
+                "project_name",
+                "project_type",
+                "business_problem",
+                "technical_stack",
+                "ai_methods",
+                "business_impact",
+                "target_roles_supported",
+                "resume_bullets",
+            ],
+        )
+        edited_projects = st.data_editor(
+            projects_df,
+            num_rows="dynamic",
+            width="stretch",
+            key="career_profile_projects_editor",
+        )
+        if st.button("Save Projects"):
+            updated_profile = {**saved_profile, "projects": dataframe_editor_rows(edited_projects)}
+            save_career_profile(updated_profile)
+            st.success("Projects saved.")
+            st.rerun()
+
+        pref_col1, pref_col2 = st.columns(2)
+        with pref_col1:
+            st.subheader("Preferences")
+            preferences_df = pd.DataFrame(
+                saved_profile.get("preferences", []),
+                columns=["preference_type", "preference_value", "weight"],
+            )
+            edited_preferences = st.data_editor(
+                preferences_df,
+                num_rows="dynamic",
+                width="stretch",
+                key="career_profile_preferences_editor",
+            )
+            if st.button("Save Preferences"):
+                updated_profile = {
+                    **saved_profile,
+                    "preferences": dataframe_editor_rows(edited_preferences),
+                }
+                save_career_profile(updated_profile)
+                st.success("Preferences saved.")
+                st.rerun()
+
+        with pref_col2:
+            st.subheader("Constraints")
+            constraints_df = pd.DataFrame(
+                saved_profile.get("constraints", []),
+                columns=["constraint_type", "constraint_value", "severity"],
+            )
+            edited_constraints = st.data_editor(
+                constraints_df,
+                num_rows="dynamic",
+                width="stretch",
+                key="career_profile_constraints_editor",
+            )
+            if st.button("Save Constraints"):
+                updated_profile = {
+                    **saved_profile,
+                    "constraints": dataframe_editor_rows(edited_constraints),
+                }
+                save_career_profile(updated_profile)
+                st.success("Constraints saved.")
+                st.rerun()
+
+        st.subheader("Feedback History")
+        feedback_history = get_career_feedback_history()
+        if feedback_history.empty:
+            st.info("No career feedback history yet.")
+        else:
+            st.dataframe(feedback_history, width="stretch", hide_index=True)
 
 
 def render_score_breakdown() -> None:
@@ -614,10 +788,10 @@ def render_job_discovery_page() -> None:
     )
 
     profile = get_career_profile()
-    profile_text = career_profile_to_text(profile)
+    profile_text = compact_career_profile_text(profile)
     st.markdown("**Using Career Profile:**")
     if profile_text:
-        st.info(profile.get("summary", "") or profile_text)
+        st.info(profile.get("headline", "") or profile.get("summary", "") or profile_text)
     else:
         st.warning("No saved career profile yet. Use the Career Profile page for better fit scoring.")
 
@@ -714,9 +888,9 @@ def render_job_discovery_page() -> None:
             "max_llm_calls_per_run": int(max_llm_calls_per_run),
             "allow_senior_roles": bool(allow_senior_roles),
             "force_refresh": bool(force_refresh),
-            "user_profile": st.session_state.user_profile or profile_text,
+            "user_profile": compact_career_profile_text(discovery_profile),
             "career_profile": discovery_profile,
-            "career_profile_text": career_profile_to_text(discovery_profile),
+            "career_profile_text": compact_career_profile_text(discovery_profile),
         }
 
         if use_sample_data:
@@ -768,11 +942,9 @@ def render_job_discovery_page() -> None:
                 st.warning(f"Could not read CSV: {exc}")
 
         jobs_with_descriptions = [job for job in jobs if job.get("jd_text", "").strip()]
-        has_analysis_context = bool(
-            st.session_state.user_profile.strip() or career_profile_to_text(discovery_profile).strip()
-        )
-        if not st.session_state.user_profile.strip() and use_sample_data:
-            settings["user_profile"] = career_profile_to_text(discovery_profile) or (
+        has_analysis_context = bool(compact_career_profile_text(discovery_profile).strip())
+        if not has_analysis_context and use_sample_data:
+            settings["user_profile"] = compact_career_profile_text(discovery_profile) or (
                 "Demo profile: early-career AI application engineer targeting AI Engineer, "
                 "GenAI Engineer, and AI Solutions Engineer roles with Python, LLM, RAG, "
                 "FastAPI, automation, SaaS, and practical business-impact projects."
@@ -782,7 +954,7 @@ def render_job_discovery_page() -> None:
         if not jobs:
             st.warning("No jobs found. Add a public URL, CSV, manual jobs, job URLs, or enable sample dataset mode for a working demo.")
         elif jobs_with_descriptions and not has_analysis_context:
-            st.warning("Add your profile/resume on the Analyze Job page or fill Career Profile Setup before scoring jobs with descriptions.")
+            st.warning("Generate or complete your Career Profile before scoring jobs with descriptions.")
         else:
             if jobs_with_descriptions and not get_openai_api_key() and int(max_llm_calls_per_run) > 0:
                 st.warning("OPENAI_API_KEY is missing. Running rule-based filtering and pre-scoring only.")
@@ -1067,9 +1239,9 @@ def render_job_queue() -> None:
             else:
                 with st.spinner("Generating application prep..."):
                     prep = generate_application_prep(
-                        st.session_state.user_profile,
+                        st.session_state.user_profile or compact_career_profile_text(get_career_profile()),
                         selected_prep.jd_text,
-                        career_profile_to_text(get_career_profile()),
+                        compact_career_profile_text(get_career_profile(), selected_prep.jd_text),
                     )
                     update_application_prep(int(selected_prep.id), prep)
                 st.success("Application prep generated. Refresh this page section to view it.")

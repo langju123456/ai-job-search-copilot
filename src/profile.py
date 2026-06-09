@@ -2,33 +2,40 @@ import json
 import re
 from datetime import datetime
 
-from src.database import fetch_career_profile, upsert_career_profile
+from src.database import (
+    fetch_career_feedback,
+    fetch_career_profile,
+    fetch_constraints,
+    fetch_preferences,
+    fetch_projects,
+    fetch_skills,
+    replace_constraints,
+    replace_preferences,
+    replace_projects,
+    replace_skills,
+    upsert_career_profile,
+)
 from src.llm import call_llm
 
 
-PROFILE_KEYS = [
+CORE_PROFILE_KEYS = [
     "name",
+    "headline",
     "summary",
     "education",
     "skills",
     "target_roles",
+    "acceptable_roles",
     "preferred_locations",
     "excluded_roles",
     "visa_status",
+    "salary_goal",
     "years_experience",
     "career_goal",
     "missing_skills",
     "suggested_locations",
     "suggested_career_paths",
 ]
-
-
-def get_career_profile() -> dict:
-    return fetch_career_profile()
-
-
-def save_career_profile(profile: dict) -> None:
-    upsert_career_profile(profile)
 
 
 def parse_json_object(text: str) -> dict:
@@ -39,45 +46,232 @@ def parse_json_object(text: str) -> dict:
     return json.loads(cleaned)
 
 
+def clean_list(items) -> list[str]:
+    if not items:
+        return []
+    if isinstance(items, str):
+        items = re.split(r"[,;\n]", items)
+    return [str(item).strip() for item in items if str(item).strip()]
+
+
+def clean_rows(rows: list[dict], required_keys: list[str]) -> list[dict]:
+    cleaned = []
+    for row in rows or []:
+        item = {key: str(row.get(key, "") or "").strip() for key in required_keys}
+        if any(item.values()):
+            cleaned.append(item)
+    return cleaned
+
+
+def derive_skill_summary(skill_rows: list[dict]) -> str:
+    if not skill_rows:
+        return ""
+    grouped = {}
+    for row in skill_rows:
+        category = row.get("category", "General") or "General"
+        grouped.setdefault(category, []).append(row.get("skill_name", ""))
+    lines = []
+    for category, skills in grouped.items():
+        skill_names = ", ".join(skill for skill in skills if skill)
+        if skill_names:
+            lines.append(f"{category}: {skill_names}")
+    return "\n".join(lines)
+
+
+def normalize_generated_profile(payload: dict) -> dict:
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    core = {}
+    for key in CORE_PROFILE_KEYS:
+        value = payload.get(key, "")
+        if isinstance(value, list):
+            core[key] = ", ".join(clean_list(value))
+        else:
+            core[key] = str(value or "").strip()
+
+    skill_rows = clean_rows(
+        payload.get("skills_inventory", []),
+        ["category", "skill_name", "proficiency", "evidence"],
+    )
+    project_rows = clean_rows(
+        payload.get("projects", []),
+        [
+            "project_name",
+            "project_type",
+            "business_problem",
+            "technical_stack",
+            "ai_methods",
+            "business_impact",
+            "target_roles_supported",
+            "resume_bullets",
+        ],
+    )
+    preference_rows = clean_rows(
+        payload.get("preferences", []),
+        ["preference_type", "preference_value", "weight"],
+    )
+    constraint_rows = clean_rows(
+        payload.get("constraints", []),
+        ["constraint_type", "constraint_value", "severity"],
+    )
+
+    if not core["skills"]:
+        core["skills"] = derive_skill_summary(skill_rows)
+
+    if not core["summary"]:
+        core["summary"] = core.get("headline", "")
+
+    core["generated_at"] = timestamp
+    core["updated_at"] = timestamp
+    return {
+        **core,
+        "skills_inventory": skill_rows,
+        "projects": project_rows,
+        "preferences": preference_rows,
+        "constraints": constraint_rows,
+    }
+
+
 def generate_career_profile_from_resume(resume_text: str) -> dict:
     system_prompt = """
 You are an AI career strategist for early-career AI Engineer, GenAI Engineer,
-AI Application Engineer, AI Solutions Engineer, and AI Application Builder roles.
-Extract a practical career profile from the resume. Return strict JSON only.
+AI Application Engineer, AI Solutions Engineer, and applied AI roles.
+
+Extract a structured career intelligence profile from the resume.
+Return strict JSON only. Be conservative and avoid inventing facts.
 """
     user_prompt = f"""
 Resume text:
 {resume_text}
 
-Return JSON with exactly these keys:
-name,
-summary,
-education,
-skills,
-target_roles,
-preferred_locations,
-excluded_roles,
-visa_status,
-years_experience,
-career_goal,
-missing_skills,
-suggested_locations,
-suggested_career_paths.
+Return JSON with exactly this shape:
+{{
+  "name": "",
+  "headline": "",
+  "summary": "",
+  "education": "",
+  "skills": "",
+  "target_roles": ["", ""],
+  "acceptable_roles": ["", ""],
+  "preferred_locations": ["", ""],
+  "excluded_roles": ["", ""],
+  "visa_status": "",
+  "salary_goal": "",
+  "years_experience": "",
+  "career_goal": "",
+  "missing_skills": "",
+  "suggested_locations": ["", ""],
+  "suggested_career_paths": ["", ""],
+  "skills_inventory": [
+    {{
+      "category": "",
+      "skill_name": "",
+      "proficiency": "",
+      "evidence": ""
+    }}
+  ],
+  "projects": [
+    {{
+      "project_name": "",
+      "project_type": "",
+      "business_problem": "",
+      "technical_stack": "",
+      "ai_methods": "",
+      "business_impact": "",
+      "target_roles_supported": "",
+      "resume_bullets": ""
+    }}
+  ],
+  "preferences": [
+    {{
+      "preference_type": "",
+      "preference_value": "",
+      "weight": ""
+    }}
+  ],
+  "constraints": [
+    {{
+      "constraint_type": "",
+      "constraint_value": "",
+      "severity": ""
+    }}
+  ]
+}}
 
-Guidance:
-- summary: concise professional summary.
-- skills: grouped inventory including Technical Skills, AI Skills, Cloud Skills.
-- missing_skills: skills to build for AI Engineer / GenAI Engineer roles.
-- target_roles: comma-separated recommended roles.
-- preferred_locations: infer from resume if possible, otherwise include Remote.
-- excluded_roles: roles that do not match the stated path.
-- visa_status: infer only if explicitly mentioned; otherwise Unknown.
-- years_experience: estimate conservatively from resume content.
-- suggested_career_paths: practical next paths toward AI application engineering.
+Rules:
+- target_roles: best-fit roles to pursue now.
+- acceptable_roles: adjacent roles still worth considering.
+- excluded_roles: roles that should usually be avoided.
+- skills_inventory: include technical, AI, cloud, product, and business-facing skills when present.
+- projects: focus on practical projects that prove AI application ability.
+- preferences: location, team type, domain, work mode, compensation, learning goals if supported.
+- constraints: visa, seniority, location, industry, or other blockers.
+- If unknown, use an empty string instead of guessing.
 """
-    generated = parse_json_object(call_llm(system_prompt, user_prompt))
-    timestamp = datetime.now().isoformat(timespec="seconds")
-    profile = {key: str(generated.get(key, "") or "") for key in PROFILE_KEYS}
-    profile["generated_at"] = timestamp
-    profile["updated_at"] = timestamp
+    payload = parse_json_object(call_llm(system_prompt, user_prompt))
+    return normalize_generated_profile(payload)
+
+
+def get_career_profile() -> dict:
+    profile = fetch_career_profile()
+    skill_rows = fetch_skills()
+    project_rows = fetch_projects()
+    preference_rows = fetch_preferences()
+    constraint_rows = fetch_constraints()
+
+    if not profile.get("skills"):
+        profile["skills"] = derive_skill_summary(skill_rows)
+
+    profile["skills_inventory"] = skill_rows
+    profile["projects"] = project_rows
+    profile["preferences"] = preference_rows
+    profile["constraints"] = constraint_rows
     return profile
+
+
+def save_career_profile(profile: dict) -> None:
+    core_profile = {key: str(profile.get(key, "") or "").strip() for key in CORE_PROFILE_KEYS}
+    core_profile["summary"] = core_profile["summary"] or core_profile.get("headline", "")
+    core_profile["generated_at"] = profile.get("generated_at", "")
+    core_profile["updated_at"] = datetime.now().isoformat(timespec="seconds")
+
+    if not core_profile["skills"]:
+        core_profile["skills"] = derive_skill_summary(profile.get("skills_inventory", []))
+
+    upsert_career_profile(core_profile)
+    replace_skills(
+        clean_rows(
+            profile.get("skills_inventory", []),
+            ["category", "skill_name", "proficiency", "evidence"],
+        )
+    )
+    replace_projects(
+        clean_rows(
+            profile.get("projects", []),
+            [
+                "project_name",
+                "project_type",
+                "business_problem",
+                "technical_stack",
+                "ai_methods",
+                "business_impact",
+                "target_roles_supported",
+                "resume_bullets",
+            ],
+        )
+    )
+    replace_preferences(
+        clean_rows(
+            profile.get("preferences", []),
+            ["preference_type", "preference_value", "weight"],
+        )
+    )
+    replace_constraints(
+        clean_rows(
+            profile.get("constraints", []),
+            ["constraint_type", "constraint_value", "severity"],
+        )
+    )
+
+
+def get_career_feedback_history():
+    return fetch_career_feedback()
