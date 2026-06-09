@@ -46,6 +46,14 @@ from src.profile import (
     get_career_profile,
     save_career_profile,
 )
+from src.resume_assets import (
+    ASSET_TYPES,
+    fetch_resume_assets,
+    generate_assets_from_career_profile,
+    resume_assets_to_text,
+    retrieve_relevant_resume_assets,
+    save_resume_assets,
+)
 from src.resume_tailor import tailor_resume
 from src.scoring import (
     compact_career_profile_text,
@@ -202,6 +210,15 @@ def format_decision_table(dataframe: pd.DataFrame) -> pd.DataFrame:
         formatted["rejection_reason"] = formatted["rejection_reason"].apply(
             lambda value: compact_text(value, "")
         )
+    return formatted
+
+
+def format_asset_table(dataframe: pd.DataFrame) -> pd.DataFrame:
+    if dataframe.empty:
+        return dataframe
+    formatted = dataframe.copy()
+    if "content" in formatted.columns:
+        formatted["content"] = formatted["content"].astype(str).str.strip()
     return formatted
 
 
@@ -487,6 +504,81 @@ def render_career_profile_page() -> None:
             st.dataframe(feedback_history, width="stretch", hide_index=True)
 
 
+def render_resume_assets_page() -> None:
+    st.header("Resume Assets")
+    st.caption("Build a reusable bullet library so application prep can retrieve evidence first and only rewrite what matters.")
+
+    profile = get_career_profile()
+    assets_df = fetch_resume_assets()
+
+    top_profile_skills = top_skill_names(profile)
+    render_labeled_markdown_grid(
+        [
+            ("Profile Headline", compact_text(profile.get("headline") or profile.get("summary"))),
+            ("Target Roles", format_list_block(profile.get("target_roles", ""))),
+            ("Projects Available", str(len(profile.get("projects", []) or []))),
+            ("Stored Assets", str(len(assets_df))),
+            ("Top Skills", compact_text(top_profile_skills)),
+        ]
+    )
+
+    st.subheader("Generate From Career Profile Projects")
+    if not (profile.get("projects", []) or []):
+        st.warning("Add projects in Career Profile before generating resume assets.")
+    else:
+        st.caption("For each saved project, the app will generate 3 technical bullets, 2 business impact bullets, and 1 leadership/collaboration bullet.")
+        if st.button("Generate Resume Assets From Projects", type="primary"):
+            if not get_openai_api_key():
+                st.warning("OPENAI_API_KEY is missing. Add it to your .env file before generating assets.")
+            else:
+                try:
+                    with st.spinner("Generating reusable resume assets..."):
+                        generated_assets = generate_assets_from_career_profile(profile)
+                        existing_assets = assets_df.to_dict("records")
+                        save_resume_assets(existing_assets + generated_assets)
+                    st.success(f"Generated {len(generated_assets)} resume assets.")
+                    st.rerun()
+                except JSONDecodeError:
+                    st.error("Resume asset generation failed because the model did not return valid structured JSON.")
+                except Exception as exc:
+                    st.error(f"Could not generate resume assets: {exc}")
+
+    st.divider()
+    st.subheader("Asset Library")
+    st.caption("Add, edit, or delete assets here. Removing a row and saving deletes it from the local library.")
+    asset_columns = [
+        "id",
+        "asset_type",
+        "title",
+        "content",
+        "skills",
+        "projects",
+        "target_roles",
+        "evidence_strength",
+        "created_at",
+        "updated_at",
+    ]
+    editable_assets = st.data_editor(
+        assets_df.reindex(columns=asset_columns),
+        num_rows="dynamic",
+        width="stretch",
+        key="resume_assets_editor",
+        column_config={
+            "asset_type": st.column_config.SelectboxColumn(
+                "asset_type",
+                options=ASSET_TYPES,
+            ),
+            "content": st.column_config.TextColumn("content", width="large"),
+        },
+        disabled=["created_at", "updated_at"],
+    )
+    if st.button("Save Resume Assets"):
+        rows = dataframe_editor_rows(editable_assets)
+        save_resume_assets(rows)
+        st.success("Resume assets saved.")
+        st.rerun()
+
+
 def render_score_breakdown() -> None:
     scores = st.session_state.score_breakdown
     if not scores:
@@ -552,11 +644,18 @@ def render_analysis_page() -> None:
             st.warning("OPENAI_API_KEY is missing. Add it to your .env file before running AI analysis.")
         else:
             try:
+                selected_assets = retrieve_relevant_resume_assets(
+                    st.session_state.job_description,
+                    profile,
+                    limit=5,
+                )
+                selected_assets_text = resume_assets_to_text(selected_assets)
                 with st.spinner("Analyzing job fit..."):
                     st.session_state.analysis = analyze_job(
                         st.session_state.user_profile,
                         st.session_state.job_description,
                         career_profile_text,
+                        selected_assets_text,
                     )
                     st.session_state.score_breakdown = parse_score_breakdown(
                         st.session_state.analysis
@@ -572,6 +671,9 @@ def render_analysis_page() -> None:
                     st.session_state.resume_tailoring = tailor_resume(
                         st.session_state.user_profile,
                         st.session_state.job_description,
+                        career_profile_text,
+                        selected_assets_text,
+                        "asset_first" if selected_assets else "full_llm",
                     )
                 with st.spinner("Generating networking messages..."):
                     st.session_state.networking_messages = generate_networking_messages(
@@ -1347,6 +1449,36 @@ def render_job_queue() -> None:
     }
     selected_prep_label = st.selectbox("Ready-to-apply job", list(prep_options.keys()))
     selected_prep = prep_options[selected_prep_label]
+    prep_profile = get_career_profile()
+    prep_assets = retrieve_relevant_resume_assets(
+        selected_prep.jd_text or selected_prep.short_description or "",
+        prep_profile,
+        limit=5,
+    )
+    prep_mode = st.selectbox(
+        "Prep mode",
+        ["asset_first", "full_llm"],
+        format_func=lambda value: "Use asset-first mode" if value == "asset_first" else "Full LLM generation mode",
+    )
+
+    st.subheader("Selected Resume Assets")
+    if prep_assets:
+        prep_assets_df = pd.DataFrame(prep_assets)[
+            [
+                "asset_type",
+                "title",
+                "content",
+                "skills",
+                "projects",
+                "target_roles",
+                "evidence_strength",
+                "match_score",
+            ]
+        ]
+        st.dataframe(format_asset_table(prep_assets_df), width="stretch", hide_index=True)
+        st.caption("Application Prep sends only the top 5 matching assets in asset-first mode.")
+    else:
+        st.info("No matching resume assets were found yet. Add assets on the Resume Assets page or use Full LLM generation mode.")
 
     st.subheader("Tailored Resume Bullets")
     if not selected_prep.resume_bullets and selected_prep.jd_text:
@@ -1361,7 +1493,10 @@ def render_job_queue() -> None:
                     prep = generate_application_prep(
                         st.session_state.user_profile or compact_career_profile_text(get_career_profile()),
                         selected_prep.jd_text,
-                        compact_career_profile_text(get_career_profile(), selected_prep.jd_text),
+                        prep_profile,
+                        compact_career_profile_text(prep_profile, selected_prep.jd_text),
+                        prep_assets if prep_mode == "asset_first" else [],
+                        prep_mode,
                     )
                     update_application_prep(int(selected_prep.id), prep)
                 st.success("Application prep generated. Refresh this page section to view it.")
@@ -1406,6 +1541,7 @@ page = st.sidebar.radio(
     [
         "Analyze Job",
         "Career Profile",
+        "Resume Assets",
         "Job Discovery",
         "Setup",
         "Job Pipeline",
@@ -1418,6 +1554,8 @@ if page == "Setup":
     render_setup_page()
 elif page == "Career Profile":
     render_career_profile_page()
+elif page == "Resume Assets":
+    render_resume_assets_page()
 elif page == "Job Discovery":
     render_job_discovery_page()
 elif page == "Job Pipeline":

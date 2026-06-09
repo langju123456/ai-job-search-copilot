@@ -223,6 +223,21 @@ CREATE TABLE IF NOT EXISTS career_feedback (
 )
 """
 
+CREATE_RESUME_ASSETS_TABLE = """
+CREATE TABLE IF NOT EXISTS resume_assets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_type TEXT,
+    title TEXT,
+    content TEXT,
+    skills TEXT,
+    projects TEXT,
+    target_roles TEXT,
+    evidence_strength TEXT,
+    created_at TEXT,
+    updated_at TEXT
+)
+"""
+
 CREATE_JOB_DISCOVERY_RUNS_TABLE = """
 CREATE TABLE IF NOT EXISTS job_discovery_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -355,6 +370,7 @@ def init_db() -> None:
         conn.execute(CREATE_PREFERENCES_TABLE)
         conn.execute(CREATE_CONSTRAINTS_TABLE)
         conn.execute(CREATE_CAREER_FEEDBACK_TABLE)
+        conn.execute(CREATE_RESUME_ASSETS_TABLE)
         conn.execute(CREATE_JOB_DISCOVERY_RUNS_TABLE)
         conn.execute(CREATE_DISCOVERED_SOURCES_TABLE)
         conn.execute(

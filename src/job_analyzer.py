@@ -28,13 +28,21 @@ Do not give generic advice. Be specific, direct, structured, and easy to copy.
 """
 
 
-def analyze_job(user_profile: str, job_description: str, career_profile: str = "") -> str:
+def analyze_job(
+    user_profile: str,
+    job_description: str,
+    career_profile: str = "",
+    resume_assets: str = "",
+) -> str:
     user_prompt = f"""
 Career profile:
 {career_profile}
 
 Candidate profile/resume:
 {user_profile}
+
+Relevant resume assets:
+{resume_assets}
 
 Job description:
 {job_description}

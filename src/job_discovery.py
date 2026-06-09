@@ -2,6 +2,7 @@ import json
 import re
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import pandas as pd
@@ -9,6 +10,7 @@ import pandas as pd
 from src.database import get_connection, init_db
 from src.job_analyzer import analyze_job
 from src.llm import call_llm
+from src.resume_assets import resume_assets_to_text, retrieve_relevant_resume_assets
 from src.resume_tailor import tailor_resume
 from src.scoring import (
     compact_career_profile_text,
@@ -917,8 +919,26 @@ def decide_apply(fit_score: int, missing_skills: list, job: dict, career_profile
     return {"apply_decision": decision, "decision_reason": "; ".join(reason)}
 
 
-def generate_application_prep(user_profile: str, job_description: str, career_profile_text: str) -> dict:
-    resume_text = tailor_resume(user_profile, job_description)
+def generate_application_prep(
+    user_profile: str,
+    job_description: str,
+    career_profile: dict,
+    career_profile_text: str,
+    selected_assets: Optional[list[dict]] = None,
+    mode: str = "asset_first",
+) -> dict:
+    selected_assets = selected_assets or []
+    selected_assets_text = resume_assets_to_text(selected_assets)
+    candidate_context = (
+        career_profile_text if mode == "asset_first" else user_profile
+    )
+    resume_text = tailor_resume(
+        candidate_context,
+        job_description,
+        career_profile_text,
+        selected_assets_text,
+        mode,
+    )
     system_prompt = """
 You prepare concise application materials for an AI Engineer job application.
 Return strict JSON only. Do not include markdown.
@@ -928,7 +948,10 @@ Career profile:
 {career_profile_text}
 
 Candidate profile/resume:
-{user_profile}
+{candidate_context}
+
+Selected resume assets:
+{selected_assets_text}
 
 Job description:
 {job_description}
@@ -939,6 +962,13 @@ cover_letter, recruiter_message, application_checklist.
 The cover_letter should be an outline, not a full polished letter.
 The recruiter_message should be direct and specific.
 The application_checklist should be a short newline-separated checklist.
+"""
+    if mode == "asset_first" and selected_assets_text.strip():
+        user_prompt += """
+
+Rules:
+- Use the selected resume assets as the evidence base.
+- Rewrite or polish those assets for this job instead of inventing new experience.
 """
     prep = parse_json_object(call_llm(system_prompt, user_prompt))
     return {
@@ -1086,7 +1116,13 @@ def evaluate_job_without_llm(
 
 def evaluate_job_with_llm(job: dict, item: dict, user_profile: str, career_profile: dict, career_profile_text: str) -> dict:
     compact_profile = compact_career_profile_text(career_profile, combined_text(job))
-    analysis = analyze_job(compact_profile or career_profile_text or user_profile, compressed_job_text(job), compact_profile or career_profile_text)
+    selected_assets = retrieve_relevant_resume_assets(job.get("jd_text", ""), career_profile, limit=5)
+    analysis = analyze_job(
+        compact_profile or career_profile_text or user_profile,
+        compressed_job_text(job),
+        compact_profile or career_profile_text,
+        resume_assets_to_text(selected_assets),
+    )
     score_breakdown = parse_score_breakdown(analysis)
     fit_score = score_breakdown["fit_score"]
     missing_skills = extract_missing_skills_from_analysis(analysis)

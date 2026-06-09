@@ -11,13 +11,25 @@ impact, product thinking, and portfolio alignment. Avoid generic advice.
 """
 
 
-def tailor_resume(user_profile: str, job_description: str) -> str:
+def tailor_resume(
+    user_profile: str,
+    job_description: str,
+    career_profile: str = "",
+    selected_assets_text: str = "",
+    mode: str = "full_llm",
+) -> str:
     user_prompt = f"""
+Career profile:
+{career_profile}
+
 Candidate profile/resume:
 {user_profile}
 
 Job description:
 {job_description}
+
+Resume assets:
+{selected_assets_text}
 
 Generate tailored resume content using exactly these sections:
 
@@ -39,5 +51,13 @@ Generate tailored resume content using exactly these sections:
 - [keyword 3]
 - [keyword 4]
 - [keyword 5]
+"""
+    if mode == "asset_first" and selected_assets_text.strip():
+        user_prompt += """
+
+Rules:
+- Reuse and polish the supplied resume assets first.
+- Do not invent a brand-new resume story when the assets already cover the evidence.
+- Prefer the strongest matching assets and rewrite them to fit the job.
 """
     return call_llm(SYSTEM_PROMPT, user_prompt)
