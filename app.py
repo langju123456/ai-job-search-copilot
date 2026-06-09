@@ -1,4 +1,5 @@
 import re
+from json import JSONDecodeError
 
 import pandas as pd
 import streamlit as st
@@ -138,6 +139,72 @@ def dataframe_editor_rows(dataframe: pd.DataFrame) -> list[dict]:
     return rows
 
 
+def compact_text(value: str, fallback: str = "Not set") -> str:
+    cleaned = str(value or "").strip()
+    return cleaned if cleaned else fallback
+
+
+def format_list_block(value: str, fallback: str = "Not set") -> str:
+    items = [item.strip() for item in re.split(r"[,;\n]", str(value or "")) if item.strip()]
+    if not items:
+        return fallback
+    return "\n".join(f"- {item}" for item in items[:8])
+
+
+def format_constraints_summary(constraints: list[dict]) -> str:
+    rows = []
+    for item in constraints or []:
+        label = str(item.get("constraint_type", "") or "").strip()
+        value = str(item.get("constraint_value", "") or "").strip()
+        severity = str(item.get("severity", "") or "").strip()
+        if label or value:
+            line = f"{label}: {value}".strip(": ")
+            if severity:
+                line = f"{line} ({severity})"
+            rows.append(line)
+    if not rows:
+        return "Not set"
+    return "\n".join(f"- {row}" for row in rows[:5])
+
+
+def top_skill_names(profile: dict, limit: int = 8) -> str:
+    rows = profile.get("skills_inventory", []) or []
+    skill_names = [str(row.get("skill_name", "") or "").strip() for row in rows]
+    skill_names = [name for name in skill_names if name]
+    if skill_names:
+        return ", ".join(skill_names[:limit])
+    return compact_text(profile.get("skills", ""), "Not set")
+
+
+def render_labeled_markdown_grid(items: list[tuple[str, str]], columns: int = 2) -> None:
+    for index in range(0, len(items), columns):
+        row = st.columns(columns)
+        for col, (label, value) in zip(row, items[index : index + columns]):
+            with col:
+                st.markdown(f"**{label}**")
+                st.markdown(value)
+
+
+def reason_to_bullets(reason: str) -> str:
+    parts = [part.strip() for part in str(reason or "").split(";") if part.strip()]
+    if not parts:
+        return "No reason recorded."
+    return "\n".join(f"- {part}" for part in parts)
+
+
+def format_decision_table(dataframe: pd.DataFrame) -> pd.DataFrame:
+    if dataframe.empty:
+        return dataframe
+    formatted = dataframe.copy()
+    if "decision_reason" in formatted.columns:
+        formatted["decision_reason"] = formatted["decision_reason"].apply(reason_to_bullets)
+    if "rejection_reason" in formatted.columns:
+        formatted["rejection_reason"] = formatted["rejection_reason"].apply(
+            lambda value: compact_text(value, "")
+        )
+    return formatted
+
+
 def render_setup_page() -> None:
     st.header("Career Profile Setup")
     profile = get_career_profile()
@@ -178,28 +245,34 @@ def render_setup_page() -> None:
 
 
 def render_career_profile_summary(profile: dict) -> None:
-    st.subheader("Career Profile Summary")
+    st.subheader("Profile Summary")
     if not any(profile.values()):
         st.info("No career profile saved yet.")
         return
 
-    card_col1, card_col2 = st.columns(2)
-    with card_col1:
-        st.markdown(f"**Headline**\n\n{profile.get('headline', '') or profile.get('summary', '') or 'Not set'}")
-        st.markdown(f"**Target Roles**\n\n{profile.get('target_roles', '') or 'Not set'}")
-        st.markdown(f"**Top Skills**\n\n{profile.get('skills', '') or 'Not set'}")
-        st.markdown(f"**Visa Status**\n\n{profile.get('visa_status', '') or 'Not set'}")
-    with card_col2:
-        st.markdown(f"**Acceptable Roles**\n\n{profile.get('acceptable_roles', '') or 'Not set'}")
-        st.markdown(f"**Missing Skills**\n\n{profile.get('missing_skills', '') or 'Not set'}")
-        st.markdown(f"**Preferred Locations**\n\n{profile.get('preferred_locations', '') or profile.get('suggested_locations', '') or 'Not set'}")
-        st.markdown(f"**Years Experience**\n\n{profile.get('years_experience', '') or 'Not set'}")
+    render_labeled_markdown_grid(
+        [
+            ("Headline", compact_text(profile.get("headline") or profile.get("summary"))),
+            ("Target Roles", format_list_block(profile.get("target_roles", ""))),
+            ("Top Skills", compact_text(top_skill_names(profile))),
+            (
+                "Preferred Locations",
+                format_list_block(
+                    profile.get("preferred_locations", "")
+                    or profile.get("suggested_locations", "")
+                ),
+            ),
+            ("Constraints", format_constraints_summary(profile.get("constraints", []))),
+            ("Visa Status", compact_text(profile.get("visa_status", ""))),
+        ]
+    )
 
 
 def render_career_profile_page() -> None:
     st.header("Career Profile")
     st.caption("Generate and edit the structured profile that powers job discovery, fit scoring, and application prep.")
 
+    st.subheader("Resume Input")
     profile_upload = st.file_uploader(
         "Upload resume",
         type=["pdf", "docx", "txt"],
@@ -226,15 +299,21 @@ def render_career_profile_page() -> None:
                     save_career_profile(profile)
                     st.session_state.user_profile = resume_text
                 st.success("Career profile generated and saved.")
+            except JSONDecodeError:
+                st.error("Profile generation failed because the model did not return valid structured JSON. Please try again.")
             except Exception as exc:
-                st.error(f"Could not generate career profile: {exc}")
+                st.error(f"Profile generation failed: {exc}")
 
     saved_profile = get_career_profile()
+    if not any(saved_profile.values()):
+        st.warning("Create a Career Profile first for better job matching.")
     render_career_profile_summary(saved_profile)
 
     if any(saved_profile.values()):
+        st.divider()
         with st.form("career_profile_core_form"):
             st.subheader("Core Profile")
+            st.caption("Edit the high-signal profile fields used across fit scoring, discovery, and prep.")
             core_col1, core_col2 = st.columns(2)
             with core_col1:
                 name = st.text_input("Name", value=saved_profile.get("name", ""))
@@ -308,7 +387,9 @@ def render_career_profile_page() -> None:
                 st.success("Core profile saved.")
                 st.rerun()
 
+        st.divider()
         st.subheader("Skill Graph")
+        st.caption("Keep the skill list concise and evidence-backed so matching stays sharp.")
         skills_df = pd.DataFrame(
             saved_profile.get("skills_inventory", []),
             columns=["category", "skill_name", "proficiency", "evidence"],
@@ -325,7 +406,9 @@ def render_career_profile_page() -> None:
             st.success("Skills saved.")
             st.rerun()
 
+        st.divider()
         st.subheader("Project Memory")
+        st.caption("These projects are the strongest evidence layer for job-fit reasoning and resume tailoring.")
         projects_df = pd.DataFrame(
             saved_profile.get("projects", []),
             columns=[
@@ -351,6 +434,7 @@ def render_career_profile_page() -> None:
             st.success("Projects saved.")
             st.rerun()
 
+        st.divider()
         pref_col1, pref_col2 = st.columns(2)
         with pref_col1:
             st.subheader("Preferences")
@@ -394,6 +478,7 @@ def render_career_profile_page() -> None:
                 st.success("Constraints saved.")
                 st.rerun()
 
+        st.divider()
         st.subheader("Feedback History")
         feedback_history = get_career_feedback_history()
         if feedback_history.empty:
@@ -789,11 +874,22 @@ def render_job_discovery_page() -> None:
 
     profile = get_career_profile()
     profile_text = compact_career_profile_text(profile)
-    st.markdown("**Using Career Profile:**")
+    st.subheader("Active Career Profile")
     if profile_text:
-        st.info(profile.get("headline", "") or profile.get("summary", "") or profile_text)
+        render_labeled_markdown_grid(
+            [
+                ("Profile Headline", compact_text(profile.get("headline") or profile.get("summary"))),
+                ("Target Roles", format_list_block(profile.get("target_roles", ""))),
+                ("Excluded Roles", format_list_block(profile.get("excluded_roles", ""))),
+                (
+                    "Preferred Locations",
+                    format_list_block(profile.get("preferred_locations", "")),
+                ),
+                ("Top Skills", compact_text(top_skill_names(profile))),
+            ]
+        )
     else:
-        st.warning("No saved career profile yet. Use the Career Profile page for better fit scoring.")
+        st.warning("Create a Career Profile first for better job matching.")
 
     with st.form("job_discovery_form"):
         st.subheader("Job Search Settings")
@@ -1032,26 +1128,42 @@ def render_job_discovery_page() -> None:
 
                 with st.expander("Rejected by Rules", expanded=True):
                     if metrics["rejected_by_rules_jobs"]:
-                        st.dataframe(metrics["rejected_by_rules_jobs"], width="stretch", hide_index=True)
+                        st.dataframe(
+                            format_decision_table(pd.DataFrame(metrics["rejected_by_rules_jobs"])),
+                            width="stretch",
+                            hide_index=True,
+                        )
                     else:
                         st.info("No jobs were rejected by deterministic rules.")
 
                 with st.expander("Below Threshold", expanded=True):
                     if metrics["below_threshold_jobs"]:
-                        st.dataframe(metrics["below_threshold_jobs"], width="stretch", hide_index=True)
+                        st.dataframe(
+                            format_decision_table(pd.DataFrame(metrics["below_threshold_jobs"])),
+                            width="stretch",
+                            hide_index=True,
+                        )
                     else:
                         st.info("No jobs fell below the pre-filter threshold.")
 
                 with st.expander("Sent to LLM"):
                     sent_to_llm = metrics["jobs_sent_to_llm_rows"]
                     if sent_to_llm:
-                        st.dataframe(sent_to_llm, width="stretch", hide_index=True)
+                        st.dataframe(
+                            format_decision_table(pd.DataFrame(sent_to_llm)),
+                            width="stretch",
+                            hide_index=True,
+                        )
                     else:
                         st.info("No jobs were sent to the LLM in this run.")
 
                 with st.expander("Main Queue", expanded=True):
                     if metrics["queued_jobs"]:
-                        st.dataframe(metrics["queued_jobs"], width="stretch", hide_index=True)
+                        st.dataframe(
+                            format_decision_table(pd.DataFrame(metrics["queued_jobs"])),
+                            width="stretch",
+                            hide_index=True,
+                        )
                     else:
                         st.info("No jobs qualified for the main queue in this run.")
 
@@ -1060,7 +1172,7 @@ def render_job_discovery_page() -> None:
 
                 with st.expander("Already Known Jobs"):
                     if metrics["known_jobs"]:
-                        st.dataframe(metrics["known_jobs"], width="stretch", hide_index=True)
+                        st.dataframe(pd.DataFrame(metrics["known_jobs"]), width="stretch", hide_index=True)
                     else:
                         st.info("No historical jobs were reused from cache.")
 
@@ -1073,13 +1185,17 @@ def render_job_discovery_page() -> None:
 
                 with st.expander("Duplicates Removed"):
                     if metrics["duplicate_jobs"]:
-                        st.dataframe(metrics["duplicate_jobs"], width="stretch", hide_index=True)
+                        st.dataframe(pd.DataFrame(metrics["duplicate_jobs"]), width="stretch", hide_index=True)
                     else:
                         st.info("No duplicates removed in this run.")
 
                 with st.expander("Pre-Scored Jobs", expanded=True):
                     if metrics["pre_scored_jobs"]:
-                        st.dataframe(metrics["pre_scored_jobs"], width="stretch", hide_index=True)
+                        st.dataframe(
+                            format_decision_table(pd.DataFrame(metrics["pre_scored_jobs"])),
+                            width="stretch",
+                            hide_index=True,
+                        )
                     else:
                         st.info("No jobs reached pre-scoring in this run.")
 
@@ -1190,7 +1306,11 @@ def render_job_queue() -> None:
             filtered_queue["location"].str.contains(location_filter, case=False, na=False)
         ]
 
-    st.dataframe(filtered_queue[display_columns], width="stretch", hide_index=True)
+    st.dataframe(
+        format_decision_table(filtered_queue[display_columns]),
+        width="stretch",
+        hide_index=True,
+    )
 
     apply_queue = queue[queue["apply_decision"] == "Apply"]
     if not apply_queue.empty:

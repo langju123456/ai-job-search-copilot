@@ -4,7 +4,7 @@ AI Job Search Copilot is a local Streamlit MVP that helps a job seeker evaluate 
 
 ## Problem Solved
 
-Job seekers often spend too much time deciding whether a role is worth applying to, how to tailor their resume, and what to say when networking. This app turns a pasted resume and job description into structured job-fit analysis, tailored resume content, networking messages, and a saved application tracker.
+Job seekers often spend too much time deciding whether a role is worth applying to, how to tailor their resume, and what to say when networking. This app turns a resume, a structured career profile, and job data into structured job-fit analysis, token-efficient discovery decisions, tailored resume content, networking messages, and a saved application tracker.
 
 ## Features
 
@@ -18,6 +18,7 @@ Job seekers often spend too much time deciding whether a role is worth applying 
 - View saved applications in a tracker table
 - Store a career profile locally in SQLite
 - Generate a structured career profile from uploaded or pasted resume text
+- Edit structured career memory for skills, projects, preferences, and constraints
 - Use the saved career profile to guide job discovery, fit analysis, and queue decisions
 - Compute structured fit scores from skill, experience, domain, career alignment, and growth components
 - Prioritize saved jobs into Must Apply, Good Opportunity, and Low Priority buckets
@@ -25,6 +26,7 @@ Job seekers often spend too much time deciding whether a role is worth applying 
 - Export resume suggestions and networking messages as `.txt` files
 - Store local data collection records for users, companies, jobs, model runs, outcomes, and feedback
 - Update application outcomes and capture lightweight analysis feedback
+- Maintain a local outcome and future-learning foundation through outcomes, model runs, and user feedback
 - View analytics for analyzed jobs, applications, interview rate, offer rate, missing skills, and top scoring companies
 - Discover jobs from pasted URLs, pasted job descriptions, or CSV uploads
 - Discover jobs from public career/job board pages with requests and BeautifulSoup
@@ -57,12 +59,13 @@ Job seekers often spend too much time deciding whether a role is worth applying 
 - `src/tracker.py` provides application tracking helpers
 - `src/scoring.py` parses structured score components and computes priority
 - `src/profile.py` reads and writes career profile memory
+- `src/profile.py` generates and persists structured career intelligence
 - `src/data_collection.py` records local learning data and analytics queries
 - `src/job_discovery.py` powers job discovery, apply decisions, queue status, and application prep
 
 ## MVP Data Note
 
-Data is stored locally in SQLite. User data is only sent to the configured LLM API for analysis. There is no multi-user login or authentication in this MVP.
+Data is stored locally in SQLite. User data is only sent to the configured LLM API for analysis. There is no multi-user login or authentication in this MVP. The local database acts as memory for career profile data, applications, outcomes, and future learning signals.
 
 ## Job Discovery CSV Format
 
@@ -84,7 +87,7 @@ The app supports public career pages, public job board/search result pages, CSV 
 
 ## Career Profile Engine
 
-The Career Profile page can parse a PDF, DOCX, TXT, or pasted resume and generate a structured local profile with summary, education, skills, target roles, preferred locations, missing skills, and career paths. Job discovery uses this saved profile so queue decisions are based on the user's actual background and goals.
+The Career Profile page can parse a PDF, DOCX, TXT, or pasted resume and generate a structured local profile with headline, summary, education, skills, target roles, acceptable roles, preferred locations, missing skills, projects, preferences, constraints, and career paths. Job discovery uses this saved profile so queue decisions are based on the user's actual background, goals, and constraints.
 
 ## How To Run Locally
 
