@@ -288,6 +288,10 @@ APPLICATION_COLUMN_DEFAULTS = {
     "analysis_profile_hash": "TEXT",
 }
 
+MODEL_RUN_COLUMN_DEFAULTS = {
+    "analysis_profile_hash": "TEXT",
+}
+
 JOB_QUEUE_COLUMN_DEFAULTS = {
     "analysis_profile_hash": "TEXT",
     "job_title": "TEXT",
@@ -339,6 +343,15 @@ def ensure_application_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE applications ADD COLUMN {column_name} {column_type}")
 
 
+def ensure_model_run_columns(conn: sqlite3.Connection) -> None:
+    existing_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(model_runs)").fetchall()
+    }
+    for column_name, column_type in MODEL_RUN_COLUMN_DEFAULTS.items():
+        if column_name not in existing_columns:
+            conn.execute(f"ALTER TABLE model_runs ADD COLUMN {column_name} {column_type}")
+
+
 def ensure_job_queue_columns(conn: sqlite3.Connection) -> None:
     existing_columns = {
         row[1] for row in conn.execute("PRAGMA table_info(job_queue)").fetchall()
@@ -366,6 +379,7 @@ def init_db() -> None:
         ensure_application_columns(conn)
         conn.execute(CREATE_OUTCOMES_TABLE)
         conn.execute(CREATE_MODEL_RUNS_TABLE)
+        ensure_model_run_columns(conn)
         conn.execute(CREATE_USER_FEEDBACK_TABLE)
         conn.execute(CREATE_JOB_QUEUE_TABLE)
         ensure_job_queue_columns(conn)

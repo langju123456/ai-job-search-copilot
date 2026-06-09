@@ -19,7 +19,7 @@ Job seekers often spend too much time deciding whether a role is worth applying 
 - Store a career profile locally in SQLite
 - Generate a structured career profile from uploaded or pasted resume text
 - Edit structured career memory for skills, projects, preferences, and constraints
-- Use the saved career profile to guide job discovery, fit analysis, and queue decisions
+- Use the saved career profile to guide profile-aware job discovery, fit analysis, and queue decisions
 - Compute structured fit scores from skill, experience, domain, career alignment, and growth components
 - Prioritize saved jobs into Must Apply, Good Opportunity, and Low Priority buckets
 - Track CRM-style fields such as recruiter name, follow-up date, next action, and interview stage
@@ -33,6 +33,8 @@ Job seekers often spend too much time deciding whether a role is worth applying 
 - Run sample discovery mode with a local sample dataset
 - Score discovered jobs and route them into an apply decision queue
 - Generate application prep for Apply decisions without submitting applications
+- Build and reuse a Resume Asset Library from structured projects and reusable bullets
+- Run asset-first application prep that retrieves top resume assets before using an LLM rewrite call
 - Run token-efficient batch evaluation with normalization, deduplication, rule-based filtering, keyword pre-scoring, and capped LLM deep analysis
 - Export discovered jobs and the Apply queue as CSV files
 - Reuse cached queue results for already-known jobs and avoid repeated LLM analysis
@@ -88,6 +90,14 @@ The app supports public career pages, public job board/search result pages, CSV 
 ## Career Profile Engine
 
 The Career Profile page can parse a PDF, DOCX, TXT, or pasted resume and generate a structured local profile with headline, summary, education, skills, target roles, acceptable roles, preferred locations, missing skills, projects, preferences, constraints, and career paths. Job discovery uses this saved profile so queue decisions are based on the user's actual background, goals, and constraints.
+
+## Resume Asset Library
+
+The Resume Assets page stores reusable bullets, project summaries, technical achievements, business impact statements, and leadership examples in local SQLite memory. Application Prep can run in asset-first mode so the app retrieves the top matching assets first, then uses the LLM only to polish the selected material for a specific job.
+
+## Local Memory And Data Flywheel
+
+SQLite acts as local memory for the career profile, job queue, resume assets, applications, outcomes, model runs, and user feedback. That creates a local outcome-learning foundation and future data flywheel without adding external services or multi-user auth.
 
 ## How To Run Locally
 
