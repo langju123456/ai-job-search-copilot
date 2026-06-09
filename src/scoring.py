@@ -53,11 +53,18 @@ def career_profile_to_text(profile: dict) -> str:
 
     lines = [
         f"Name: {profile.get('name', '')}",
+        f"Professional summary: {profile.get('summary', '')}",
+        f"Education: {profile.get('education', '')}",
+        f"Skills: {profile.get('skills', '')}",
         f"Target roles: {profile.get('target_roles', '')}",
-        f"Visa status: {profile.get('visa_status', '')}",
         f"Preferred locations: {profile.get('preferred_locations', '')}",
+        f"Excluded roles: {profile.get('excluded_roles', '')}",
+        f"Visa status: {profile.get('visa_status', '')}",
         f"Salary goal: {profile.get('salary_goal', '')}",
         f"Years of experience: {profile.get('years_experience', '')}",
         f"Career goal: {profile.get('career_goal', '')}",
+        f"Missing skills: {profile.get('missing_skills', '')}",
+        f"Suggested locations: {profile.get('suggested_locations', '')}",
+        f"Suggested career paths: {profile.get('suggested_career_paths', '')}",
     ]
     return "\n".join(line for line in lines if not line.endswith(": "))

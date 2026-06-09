@@ -17,6 +17,8 @@ Job seekers often spend too much time deciding whether a role is worth applying 
 - Save applications to SQLite
 - View saved applications in a tracker table
 - Store a career profile locally in SQLite
+- Generate a structured career profile from uploaded or pasted resume text
+- Use the saved career profile to guide job discovery, fit analysis, and queue decisions
 - Compute structured fit scores from skill, experience, domain, career alignment, and growth components
 - Prioritize saved jobs into Must Apply, Good Opportunity, and Low Priority buckets
 - Track CRM-style fields such as recruiter name, follow-up date, next action, and interview stage
@@ -31,6 +33,7 @@ Job seekers often spend too much time deciding whether a role is worth applying 
 - Generate application prep for Apply decisions without submitting applications
 - Run token-efficient batch evaluation with normalization, deduplication, rule-based filtering, keyword pre-scoring, and capped LLM deep analysis
 - Export discovered jobs and the Apply queue as CSV files
+- Reuse cached queue results for already-known jobs and avoid repeated LLM analysis
 
 ## Tech Stack
 
@@ -78,6 +81,10 @@ The Job Discovery page avoids sending every job to the LLM. It first normalizes 
 ## Public Job Discovery
 
 The app supports public career pages, public job board/search result pages, CSV uploads, pasted jobs, pasted URLs, and sample dataset mode. Discovered jobs are normalized, deduplicated, filtered cheaply, and then routed into the same Job Queue pipeline.
+
+## Career Profile Engine
+
+The Career Profile page can parse a PDF, DOCX, TXT, or pasted resume and generate a structured local profile with summary, education, skills, target roles, preferred locations, missing skills, and career paths. Job discovery uses this saved profile so queue decisions are based on the user's actual background and goals.
 
 ## How To Run Locally
 

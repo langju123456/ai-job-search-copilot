@@ -537,7 +537,21 @@ def infer_post_time(raw_text: str) -> str:
 def should_filter_job(job: dict, settings: dict) -> dict:
     text = combined_text(job)
     allow_senior_roles = bool(settings.get("allow_senior_roles", False))
+    career_profile = settings.get("career_profile", {}) or {}
     job_level = job.get("job_level", "Unknown")
+
+    excluded_roles = [
+        role.strip().lower()
+        for role in re.split(r"[,;]", career_profile.get("excluded_roles", ""))
+        if role.strip()
+    ]
+    for role in excluded_roles:
+        if role and role in text:
+            return {
+                "filtered": True,
+                "category": "Filtered",
+                "reason": f"Filtered by excluded role: {role}",
+            }
 
     for keyword in HARD_NEGATIVE_KEYWORDS:
         if keyword in text:
@@ -605,47 +619,91 @@ def job_identity(job: dict) -> tuple:
     )
 
 
-def existing_queue_keys() -> tuple:
+def job_cache_key(job: dict) -> tuple:
+    return (
+        normalize_key(job.get("company", "")),
+        normalize_key(job.get("job_title", "")),
+        normalize_key(job.get("location", "")),
+        normalize_text(job.get("job_url", "")).lower(),
+    )
+
+
+def existing_queue_index() -> dict:
     init_db()
     with get_connection() as conn:
         rows = conn.execute(
             """
-            SELECT company, COALESCE(job_title, title, ''), location, job_url
+            SELECT
+                company,
+                COALESCE(job_title, title, '') AS job_title,
+                location,
+                job_url,
+                fit_score,
+                apply_decision,
+                COALESCE(decision_reason, reason, '') AS decision_reason,
+                analysis_text,
+                pre_filter_score,
+                COALESCE(queue_category, apply_decision, '') AS queue_category
             FROM job_queue
             """
         ).fetchall()
-    identity_keys = set()
-    url_keys = set()
-    for company, job_title, location, job_url in rows:
-        identity_keys.add((normalize_key(company), normalize_key(job_title), normalize_key(location)))
-        if job_url:
-            url_keys.add(normalize_text(job_url).lower())
-    return identity_keys, url_keys
+    cache = {}
+    for row in rows:
+        company, job_title, location, job_url = row[:4]
+        item = {
+            "company": company or "",
+            "job_title": job_title or "",
+            "location": location or "",
+            "job_url": job_url or "",
+            "fit_score": row[4] or 0,
+            "apply_decision": row[5] or "",
+            "decision_reason": row[6] or "",
+            "analysis_text": row[7] or "",
+            "pre_filter_score": row[8] or 0,
+            "queue_category": row[9] or "",
+        }
+        cache[job_cache_key(item)] = item
+        if item["job_url"]:
+            cache[("", "", "", item["job_url"].lower())] = item
+    return cache
 
 
-def deduplicate_jobs(jobs: list) -> tuple:
-    existing_identities, existing_urls = existing_queue_keys()
+def deduplicate_jobs(jobs: list, force_refresh: bool = False) -> tuple:
+    existing_jobs = existing_queue_index()
     seen_identities = set()
     seen_urls = set()
     unique_jobs = []
+    known_jobs = []
     duplicate_jobs = []
 
     for raw_job in jobs:
         job = normalize_job(raw_job)
         identity = job_identity(job)
         url_key = job["job_url"].lower()
-        is_duplicate = identity in existing_identities or identity in seen_identities
+        exact_key = job_cache_key(job)
+        url_cache_key = ("", "", "", url_key)
+        cached_job = existing_jobs.get(exact_key) or existing_jobs.get(url_cache_key)
+        is_known = bool(cached_job) and not force_refresh
+        is_duplicate = identity in seen_identities
         if url_key:
-            is_duplicate = is_duplicate or url_key in existing_urls or url_key in seen_urls
+            is_duplicate = is_duplicate or url_key in seen_urls
 
-        if is_duplicate:
-            duplicate_jobs.append({**job, "duplicate_reason": "Already exists in queue or current batch"})
+        if is_known:
+            known_jobs.append(
+                {
+                    **job,
+                    "existing_reason": "Already known from historical queue",
+                    "cached_result": cached_job,
+                }
+            )
+        elif is_duplicate:
+            duplicate_jobs.append({**job, "duplicate_reason": "Duplicate within current run"})
         else:
             unique_jobs.append(job)
             seen_identities.add(identity)
             if url_key:
                 seen_urls.add(url_key)
-    return unique_jobs, duplicate_jobs
+    return unique_jobs, known_jobs, duplicate_jobs
 
 
 def combined_text(job: dict) -> str:
@@ -991,13 +1049,17 @@ def process_discovered_jobs(
     max_llm_calls_per_run: int = DEFAULT_MAX_LLM_CALLS_PER_RUN,
     max_jobs_per_run: int = DEFAULT_MAX_JOBS_PER_RUN,
     allow_senior_roles: bool = False,
+    force_refresh: bool = False,
 ) -> dict:
     selected_jobs = jobs[:max_jobs_per_run]
     normalized_jobs = [normalize_job(job) for job in selected_jobs]
-    unique_jobs, duplicate_jobs = deduplicate_jobs(normalized_jobs)
+    unique_jobs, known_jobs, duplicate_jobs = deduplicate_jobs(normalized_jobs, force_refresh)
 
     metrics = {
         "jobs_discovered": len(jobs),
+        "selected_jobs": len(selected_jobs),
+        "already_known_jobs": len(known_jobs),
+        "new_jobs": len(unique_jobs),
         "jobs_rejected_by_rules": 0,
         "jobs_below_threshold": 0,
         "jobs_filtered_rejected": len(duplicate_jobs),
@@ -1009,11 +1071,14 @@ def process_discovered_jobs(
         "jobs_added_to_queue": 0,
         "actual_llm_calls_used": 0,
         "skipped_llm_calls": 0,
-        "llm_calls_avoided": len(duplicate_jobs),
+        "cache_hits": len(known_jobs),
+        "cache_misses": len(unique_jobs),
+        "llm_calls_avoided": len(duplicate_jobs) + len(known_jobs),
         "estimated_token_savings": 0,
         "estimated_tokens_saved": 0,
         "token_savings_formula": f"llm_calls_avoided * {LLM_TOKEN_ESTIMATE_PER_FULL_JOB} tokens",
         "imported_jobs": normalized_jobs,
+        "known_jobs": known_jobs,
         "duplicate_jobs": duplicate_jobs,
         "rejected_by_rules_jobs": [],
         "below_threshold_jobs": [],
@@ -1039,8 +1104,26 @@ def process_discovered_jobs(
         duplicate_item["queue_category"] = "Filtered"
         metrics["processed_jobs"].append(duplicate_item)
 
+    for known_job in known_jobs:
+        cached_result = known_job.get("cached_result", {})
+        known_item = empty_queue_item(known_job)
+        known_item["fit_score"] = cached_result.get("fit_score", 0)
+        known_item["pre_filter_score"] = cached_result.get("pre_filter_score", 0)
+        known_item["apply_decision"] = cached_result.get("apply_decision", "")
+        known_item["decision_reason"] = cached_result.get("decision_reason", "Reused cached analysis.")
+        known_item["analysis_text"] = cached_result.get("analysis_text", "")
+        known_item["queue_category"] = cached_result.get("queue_category", known_item["apply_decision"])
+        known_item["status"] = "Reviewed"
+        metrics["processed_jobs"].append(known_item)
+
     for job in unique_jobs:
-        structured_filter = should_filter_job(job, {"allow_senior_roles": allow_senior_roles})
+        structured_filter = should_filter_job(
+            job,
+            {
+                "allow_senior_roles": allow_senior_roles,
+                "career_profile": career_profile,
+            },
+        )
         if structured_filter["filtered"]:
             item = empty_queue_item(job)
             item["decision_reason"] = structured_filter["reason"]
@@ -1121,6 +1204,7 @@ def run_discovery_pipeline(jobs: list, settings: dict) -> dict:
         int(settings.get("max_llm_calls_per_run", DEFAULT_MAX_LLM_CALLS_PER_RUN)),
         int(settings.get("max_jobs_per_run", DEFAULT_MAX_JOBS_PER_RUN)),
         bool(settings.get("allow_senior_roles", False)),
+        bool(settings.get("force_refresh", False)),
     )
 
 

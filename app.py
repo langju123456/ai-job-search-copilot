@@ -39,7 +39,11 @@ from src.job_discovery import (
 )
 from src.llm import get_openai_api_key
 from src.networking import generate_networking_messages
-from src.profile import get_career_profile, save_career_profile
+from src.profile import (
+    generate_career_profile_from_resume,
+    get_career_profile,
+    save_career_profile,
+)
 from src.resume_tailor import tailor_resume
 from src.scoring import (
     career_profile_to_text,
@@ -94,6 +98,7 @@ def initialize_session_state() -> None:
         "analysis": "",
         "resume_tailoring": "",
         "networking_messages": "",
+        "career_profile_resume_text": "",
         "score_breakdown": {},
         "computed_fit_score": 0,
         "priority": "",
@@ -148,6 +153,79 @@ def render_setup_page() -> None:
     if any(saved_profile.values()):
         st.subheader("Saved Profile")
         st.json(saved_profile)
+
+
+def render_career_profile_summary(profile: dict) -> None:
+    st.subheader("Career Profile Summary")
+    if not any(profile.values()):
+        st.info("No career profile saved yet.")
+        return
+
+    card_col1, card_col2 = st.columns(2)
+    with card_col1:
+        st.markdown(f"**Target Roles**\n\n{profile.get('target_roles', '') or 'Not set'}")
+        st.markdown(f"**Top Skills**\n\n{profile.get('skills', '') or 'Not set'}")
+        st.markdown(f"**Visa Status**\n\n{profile.get('visa_status', '') or 'Not set'}")
+    with card_col2:
+        st.markdown(f"**Missing Skills**\n\n{profile.get('missing_skills', '') or 'Not set'}")
+        st.markdown(f"**Preferred Locations**\n\n{profile.get('preferred_locations', '') or profile.get('suggested_locations', '') or 'Not set'}")
+        st.markdown(f"**Years Experience**\n\n{profile.get('years_experience', '') or 'Not set'}")
+
+
+def render_career_profile_page() -> None:
+    st.header("Career Profile")
+    st.caption("Generate a user-centric career profile from your resume before running job discovery.")
+
+    profile_upload = st.file_uploader(
+        "Upload resume",
+        type=["pdf", "docx", "txt"],
+        key="career_profile_upload",
+    )
+    populate_text_from_upload(profile_upload, "career_profile_resume_text", "career profile resume")
+
+    st.text_area(
+        "Paste resume text",
+        key="career_profile_resume_text",
+        height=260,
+    )
+
+    if st.button("Generate Career Profile", type="primary"):
+        resume_text = st.session_state.get("career_profile_resume_text", "").strip()
+        if not resume_text:
+            st.warning("Upload or paste your resume before generating a career profile.")
+        elif not get_openai_api_key():
+            st.warning("OPENAI_API_KEY is missing. Add it to your .env file before generating a profile.")
+        else:
+            try:
+                with st.spinner("Generating career profile..."):
+                    profile = generate_career_profile_from_resume(resume_text)
+                    save_career_profile(profile)
+                    st.session_state.user_profile = resume_text
+                st.success("Career profile generated and saved.")
+            except Exception as exc:
+                st.error(f"Could not generate career profile: {exc}")
+
+    saved_profile = get_career_profile()
+    render_career_profile_summary(saved_profile)
+
+    if any(saved_profile.values()):
+        st.subheader("Structured Profile")
+        profile_sections = [
+            ("Professional Summary", "summary"),
+            ("Education", "education"),
+            ("Skill Inventory", "skills"),
+            ("Suggested Target Roles", "target_roles"),
+            ("Suggested Locations", "suggested_locations"),
+            ("Preferred Locations", "preferred_locations"),
+            ("Missing Skills", "missing_skills"),
+            ("Suggested Career Paths", "suggested_career_paths"),
+            ("Excluded Roles", "excluded_roles"),
+        ]
+        for label, key in profile_sections:
+            value = saved_profile.get(key, "")
+            if value:
+                st.markdown(f"**{label}**")
+                st.write(value)
 
 
 def render_score_breakdown() -> None:
@@ -536,6 +614,12 @@ def render_job_discovery_page() -> None:
     )
 
     profile = get_career_profile()
+    profile_text = career_profile_to_text(profile)
+    st.markdown("**Using Career Profile:**")
+    if profile_text:
+        st.info(profile.get("summary", "") or profile_text)
+    else:
+        st.warning("No saved career profile yet. Use the Career Profile page for better fit scoring.")
 
     with st.form("job_discovery_form"):
         st.subheader("Job Search Settings")
@@ -575,6 +659,7 @@ def render_job_discovery_page() -> None:
                 step=5,
             )
             allow_senior_roles = st.checkbox("Allow senior roles")
+            force_refresh = st.checkbox("Force refresh known jobs")
         max_llm_calls_per_run = st.number_input(
             "Max LLM calls per run",
             min_value=0,
@@ -628,7 +713,8 @@ def render_job_discovery_page() -> None:
             "max_jobs_per_run": int(max_jobs_per_run),
             "max_llm_calls_per_run": int(max_llm_calls_per_run),
             "allow_senior_roles": bool(allow_senior_roles),
-            "user_profile": st.session_state.user_profile,
+            "force_refresh": bool(force_refresh),
+            "user_profile": st.session_state.user_profile or profile_text,
             "career_profile": discovery_profile,
             "career_profile_text": career_profile_to_text(discovery_profile),
         }
@@ -711,14 +797,19 @@ def render_job_discovery_page() -> None:
 
             if metrics:
                 metric_defaults = {
+                    "already_known_jobs": 0,
+                    "new_jobs": len(metrics.get("queued_jobs", [])),
                     "jobs_rejected_by_rules": 0,
                     "jobs_below_threshold": 0,
                     "jobs_filtered_rejected": metrics.get("jobs_filtered_out", 0),
                     "jobs_added_to_queue": len(metrics.get("queued_jobs", [])),
                     "actual_llm_calls_used": metrics.get("jobs_sent_to_llm", 0),
                     "llm_calls_avoided": metrics.get("skipped_llm_calls", 0),
+                    "cache_hits": 0,
+                    "cache_misses": 0,
                     "estimated_tokens_saved": metrics.get("estimated_token_savings", 0),
                     "token_savings_formula": "llm_calls_avoided * 750 tokens",
+                    "known_jobs": [],
                     "rejected_by_rules_jobs": [],
                     "below_threshold_jobs": [],
                     "queued_jobs": [],
@@ -740,15 +831,20 @@ def render_job_discovery_page() -> None:
                 st.success(f"Added {metrics['jobs_added_to_queue']} job(s) to the main queue.")
                 metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
                 metric_col1.metric("Jobs Discovered", metrics["jobs_discovered"])
-                metric_col2.metric("Duplicates Removed", metrics["duplicates_removed"])
-                metric_col3.metric("Rejected by Rules", metrics["jobs_rejected_by_rules"])
-                metric_col4.metric("Below Threshold", metrics["jobs_below_threshold"])
+                metric_col2.metric("Already Known Jobs", metrics["already_known_jobs"])
+                metric_col3.metric("New Jobs", metrics["new_jobs"])
+                metric_col4.metric("Duplicates Removed", metrics["duplicates_removed"])
 
                 metric_col5, metric_col6, metric_col7, metric_col8 = st.columns(4)
-                metric_col5.metric("Pre-scored", metrics["jobs_pre_scored"])
-                metric_col6.metric("Sent to LLM", metrics["jobs_sent_to_llm"])
-                metric_col7.metric("Added to Main Queue", metrics["jobs_added_to_queue"])
-                metric_col8.metric("Filtered / Rejected", metrics["jobs_filtered_rejected"])
+                metric_col5.metric("Rejected by Rules", metrics["jobs_rejected_by_rules"])
+                metric_col6.metric("Below Threshold", metrics["jobs_below_threshold"])
+                metric_col7.metric("Sent to LLM", metrics["jobs_sent_to_llm"])
+                metric_col8.metric("Added to Main Queue", metrics["jobs_added_to_queue"])
+
+                metric_col9, metric_col10, metric_col11 = st.columns(3)
+                metric_col9.metric("Pre-scored", metrics["jobs_pre_scored"])
+                metric_col10.metric("Cache Hits", metrics["cache_hits"])
+                metric_col11.metric("Cache Misses", metrics["cache_misses"])
 
                 st.subheader("Token Efficiency")
                 token_col1, token_col2, token_col3, token_col4, token_col5 = st.columns(5)
@@ -789,6 +885,12 @@ def render_job_discovery_page() -> None:
 
                 with st.expander("Full Raw Discovery Log"):
                     st.dataframe(metrics["processed_jobs"], width="stretch", hide_index=True)
+
+                with st.expander("Already Known Jobs"):
+                    if metrics["known_jobs"]:
+                        st.dataframe(metrics["known_jobs"], width="stretch", hide_index=True)
+                    else:
+                        st.info("No historical jobs were reused from cache.")
 
                 st.download_button(
                     "Export Discovered Jobs CSV",
@@ -1011,6 +1113,7 @@ page = st.sidebar.radio(
     "Page",
     [
         "Analyze Job",
+        "Career Profile",
         "Job Discovery",
         "Setup",
         "Job Pipeline",
@@ -1021,6 +1124,8 @@ page = st.sidebar.radio(
 
 if page == "Setup":
     render_setup_page()
+elif page == "Career Profile":
+    render_career_profile_page()
 elif page == "Job Discovery":
     render_job_discovery_page()
 elif page == "Job Pipeline":

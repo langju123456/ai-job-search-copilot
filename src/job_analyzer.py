@@ -9,6 +9,10 @@ Evaluate the job using the required scoring framework. The component scores
 must be realistic, defensible, and based on the candidate profile, career
 profile, and job description.
 
+Evaluate relative to the user's actual background, skills, goals, constraints,
+target roles, location preferences, seniority fit, and missing skills. Do not
+score a job highly just because the job is generally strong.
+
 Do not give generic advice. Be specific, direct, structured, and easy to copy.
 """
 
@@ -57,6 +61,13 @@ Return the analysis using exactly these sections:
 ## Why This Job May Not Be A Good Fit
 - [specific risk]
 - [specific risk]
+
+## Fit Reasoning
+- Target role alignment: [specific reasoning]
+- Skills overlap: [specific reasoning]
+- Missing skills impact: [specific reasoning]
+- Location and seniority fit: [specific reasoning]
+- AI relevance and growth potential: [specific reasoning]
 
 ## Final Recommendation
 - Recommendation: [Apply / Maybe / Skip]

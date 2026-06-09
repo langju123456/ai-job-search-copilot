@@ -144,12 +144,21 @@ CREATE_CAREER_PROFILE_TABLE = """
 CREATE TABLE IF NOT EXISTS career_profile (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     name TEXT,
+    summary TEXT,
+    education TEXT,
+    skills TEXT,
     target_roles TEXT,
-    visa_status TEXT,
     preferred_locations TEXT,
+    excluded_roles TEXT,
+    visa_status TEXT,
     salary_goal TEXT,
     years_experience TEXT,
-    career_goal TEXT
+    career_goal TEXT,
+    missing_skills TEXT,
+    suggested_locations TEXT,
+    suggested_career_paths TEXT,
+    generated_at TEXT,
+    updated_at TEXT
 )
 """
 
@@ -216,6 +225,21 @@ JOB_QUEUE_COLUMN_DEFAULTS = {
     "updated_at": "TEXT",
 }
 
+CAREER_PROFILE_COLUMN_DEFAULTS = {
+    "summary": "TEXT",
+    "education": "TEXT",
+    "skills": "TEXT",
+    "preferred_locations": "TEXT",
+    "excluded_roles": "TEXT",
+    "salary_goal": "TEXT",
+    "career_goal": "TEXT",
+    "missing_skills": "TEXT",
+    "suggested_locations": "TEXT",
+    "suggested_career_paths": "TEXT",
+    "generated_at": "TEXT",
+    "updated_at": "TEXT",
+}
+
 
 def get_connection() -> sqlite3.Connection:
     return sqlite3.connect(DB_PATH)
@@ -239,6 +263,15 @@ def ensure_job_queue_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE job_queue ADD COLUMN {column_name} {column_type}")
 
 
+def ensure_career_profile_columns(conn: sqlite3.Connection) -> None:
+    existing_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(career_profile)").fetchall()
+    }
+    for column_name, column_type in CAREER_PROFILE_COLUMN_DEFAULTS.items():
+        if column_name not in existing_columns:
+            conn.execute(f"ALTER TABLE career_profile ADD COLUMN {column_name} {column_type}")
+
+
 def init_db() -> None:
     with get_connection() as conn:
         conn.execute(CREATE_USERS_TABLE)
@@ -252,6 +285,7 @@ def init_db() -> None:
         conn.execute(CREATE_JOB_QUEUE_TABLE)
         ensure_job_queue_columns(conn)
         conn.execute(CREATE_CAREER_PROFILE_TABLE)
+        ensure_career_profile_columns(conn)
         conn.execute(CREATE_JOB_DISCOVERY_RUNS_TABLE)
         conn.execute(CREATE_DISCOVERED_SOURCES_TABLE)
         conn.execute(
@@ -383,31 +417,58 @@ def upsert_career_profile(profile: dict) -> None:
             INSERT INTO career_profile (
                 id,
                 name,
+                summary,
+                education,
+                skills,
                 target_roles,
-                visa_status,
                 preferred_locations,
+                excluded_roles,
+                visa_status,
                 salary_goal,
                 years_experience,
-                career_goal
+                career_goal,
+                missing_skills,
+                suggested_locations,
+                suggested_career_paths,
+                generated_at,
+                updated_at
             )
-            VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
+                summary = excluded.summary,
+                education = excluded.education,
+                skills = excluded.skills,
                 target_roles = excluded.target_roles,
-                visa_status = excluded.visa_status,
                 preferred_locations = excluded.preferred_locations,
+                excluded_roles = excluded.excluded_roles,
+                visa_status = excluded.visa_status,
                 salary_goal = excluded.salary_goal,
                 years_experience = excluded.years_experience,
-                career_goal = excluded.career_goal
+                career_goal = excluded.career_goal,
+                missing_skills = excluded.missing_skills,
+                suggested_locations = excluded.suggested_locations,
+                suggested_career_paths = excluded.suggested_career_paths,
+                generated_at = COALESCE(career_profile.generated_at, excluded.generated_at),
+                updated_at = excluded.updated_at
             """,
             (
-                profile["name"],
-                profile["target_roles"],
-                profile["visa_status"],
-                profile["preferred_locations"],
-                profile["salary_goal"],
-                profile["years_experience"],
-                profile["career_goal"],
+                profile.get("name", ""),
+                profile.get("summary", ""),
+                profile.get("education", ""),
+                profile.get("skills", ""),
+                profile.get("target_roles", ""),
+                profile.get("preferred_locations", ""),
+                profile.get("excluded_roles", ""),
+                profile.get("visa_status", ""),
+                profile.get("salary_goal", ""),
+                profile.get("years_experience", ""),
+                profile.get("career_goal", ""),
+                profile.get("missing_skills", ""),
+                profile.get("suggested_locations", ""),
+                profile.get("suggested_career_paths", ""),
+                profile.get("generated_at", ""),
+                profile.get("updated_at", ""),
             ),
         )
         conn.commit()
@@ -420,12 +481,21 @@ def fetch_career_profile() -> dict:
             """
             SELECT
                 name,
+                summary,
+                education,
+                skills,
                 target_roles,
-                visa_status,
                 preferred_locations,
+                excluded_roles,
+                visa_status,
                 salary_goal,
                 years_experience,
-                career_goal
+                career_goal,
+                missing_skills,
+                suggested_locations,
+                suggested_career_paths,
+                generated_at,
+                updated_at
             FROM career_profile
             WHERE id = 1
             """
@@ -434,20 +504,38 @@ def fetch_career_profile() -> dict:
     if not row:
         return {
             "name": "",
+            "summary": "",
+            "education": "",
+            "skills": "",
             "target_roles": "",
-            "visa_status": "",
             "preferred_locations": "",
+            "excluded_roles": "",
+            "visa_status": "",
             "salary_goal": "",
             "years_experience": "",
             "career_goal": "",
+            "missing_skills": "",
+            "suggested_locations": "",
+            "suggested_career_paths": "",
+            "generated_at": "",
+            "updated_at": "",
         }
 
     return {
         "name": row[0] or "",
-        "target_roles": row[1] or "",
-        "visa_status": row[2] or "",
-        "preferred_locations": row[3] or "",
-        "salary_goal": row[4] or "",
-        "years_experience": row[5] or "",
-        "career_goal": row[6] or "",
+        "summary": row[1] or "",
+        "education": row[2] or "",
+        "skills": row[3] or "",
+        "target_roles": row[4] or "",
+        "preferred_locations": row[5] or "",
+        "excluded_roles": row[6] or "",
+        "visa_status": row[7] or "",
+        "salary_goal": row[8] or "",
+        "years_experience": row[9] or "",
+        "career_goal": row[10] or "",
+        "missing_skills": row[11] or "",
+        "suggested_locations": row[12] or "",
+        "suggested_career_paths": row[13] or "",
+        "generated_at": row[14] or "",
+        "updated_at": row[15] or "",
     }
