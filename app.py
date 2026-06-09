@@ -574,6 +574,7 @@ def render_job_discovery_page() -> None:
                 value=DEFAULT_MAX_JOBS_PER_RUN,
                 step=5,
             )
+            allow_senior_roles = st.checkbox("Allow senior roles")
         max_llm_calls_per_run = st.number_input(
             "Max LLM calls per run",
             min_value=0,
@@ -626,6 +627,7 @@ def render_job_discovery_page() -> None:
             "pre_filter_threshold": int(pre_filter_threshold),
             "max_jobs_per_run": int(max_jobs_per_run),
             "max_llm_calls_per_run": int(max_llm_calls_per_run),
+            "allow_senior_roles": bool(allow_senior_roles),
             "user_profile": st.session_state.user_profile,
             "career_profile": discovery_profile,
             "career_profile_text": career_profile_to_text(discovery_profile),
@@ -715,31 +717,59 @@ def render_job_discovery_page() -> None:
                     target_locations,
                     metrics,
                 )
-                st.success(f"Queued {len(metrics['queued_jobs'])} new job(s).")
+                st.success(f"Added {metrics['jobs_added_to_queue']} job(s) to the main queue.")
                 metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
                 metric_col1.metric("Jobs Discovered", metrics["jobs_discovered"])
                 metric_col2.metric("Duplicates Removed", metrics["duplicates_removed"])
-                metric_col3.metric("Filtered Out", metrics["jobs_filtered_out"])
-                metric_col4.metric("Pre-scored", metrics["jobs_pre_scored"])
+                metric_col3.metric("Rejected by Rules", metrics["jobs_rejected_by_rules"])
+                metric_col4.metric("Below Threshold", metrics["jobs_below_threshold"])
 
-                metric_col5, metric_col6, metric_col7 = st.columns(3)
-                metric_col5.metric("Sent to LLM", metrics["jobs_sent_to_llm"])
-                metric_col6.metric("Added to Queue", metrics["jobs_added_to_queue"])
-                metric_col7.metric("Est. Token Savings", metrics["estimated_token_savings"])
+                metric_col5, metric_col6, metric_col7, metric_col8 = st.columns(4)
+                metric_col5.metric("Pre-scored", metrics["jobs_pre_scored"])
+                metric_col6.metric("Sent to LLM", metrics["jobs_sent_to_llm"])
+                metric_col7.metric("Added to Main Queue", metrics["jobs_added_to_queue"])
+                metric_col8.metric("Filtered / Rejected", metrics["jobs_filtered_rejected"])
 
                 st.subheader("Token Efficiency")
                 token_col1, token_col2, token_col3, token_col4, token_col5 = st.columns(5)
                 token_col1.metric("Max Jobs", int(max_jobs_per_run))
                 token_col2.metric("Max LLM Calls", int(max_llm_calls_per_run))
                 token_col3.metric("Actual LLM Calls", metrics["actual_llm_calls_used"])
-                token_col4.metric("Skipped LLM Calls", metrics["skipped_llm_calls"])
-                token_col5.metric("Token Savings", metrics["estimated_token_savings"])
+                token_col4.metric("LLM Calls Avoided", metrics["llm_calls_avoided"])
+                token_col5.metric("Tokens Saved", metrics["estimated_tokens_saved"])
+                st.caption(f"Formula: {metrics['token_savings_formula']}")
 
                 if metrics["jobs_sent_to_llm"] >= settings["max_llm_calls_per_run"] and settings["max_llm_calls_per_run"] > 0:
                     st.warning("Max LLM calls per run was reached. Remaining qualified jobs stayed in the queue without deep analysis.")
 
-                with st.expander("Raw Discovered Jobs", expanded=True):
-                    st.dataframe(metrics["imported_jobs"], width="stretch", hide_index=True)
+                with st.expander("Rejected by Rules", expanded=True):
+                    if metrics["rejected_by_rules_jobs"]:
+                        st.dataframe(metrics["rejected_by_rules_jobs"], width="stretch", hide_index=True)
+                    else:
+                        st.info("No jobs were rejected by deterministic rules.")
+
+                with st.expander("Below Threshold", expanded=True):
+                    if metrics["below_threshold_jobs"]:
+                        st.dataframe(metrics["below_threshold_jobs"], width="stretch", hide_index=True)
+                    else:
+                        st.info("No jobs fell below the pre-filter threshold.")
+
+                with st.expander("Sent to LLM"):
+                    sent_to_llm = metrics["jobs_sent_to_llm_rows"]
+                    if sent_to_llm:
+                        st.dataframe(sent_to_llm, width="stretch", hide_index=True)
+                    else:
+                        st.info("No jobs were sent to the LLM in this run.")
+
+                with st.expander("Main Queue", expanded=True):
+                    if metrics["queued_jobs"]:
+                        st.dataframe(metrics["queued_jobs"], width="stretch", hide_index=True)
+                    else:
+                        st.info("No jobs qualified for the main queue in this run.")
+
+                with st.expander("Full Raw Discovery Log"):
+                    st.dataframe(metrics["processed_jobs"], width="stretch", hide_index=True)
+
                 st.download_button(
                     "Export Discovered Jobs CSV",
                     data=pd.DataFrame(metrics["imported_jobs"]).to_csv(index=False),
@@ -753,27 +783,11 @@ def render_job_discovery_page() -> None:
                     else:
                         st.info("No duplicates removed in this run.")
 
-                with st.expander("Filtered Out Jobs"):
-                    if metrics["filtered_out_jobs"]:
-                        st.dataframe(metrics["filtered_out_jobs"], width="stretch", hide_index=True)
-                    else:
-                        st.info("No jobs were filtered out in this run.")
-
                 with st.expander("Pre-Scored Jobs", expanded=True):
                     if metrics["pre_scored_jobs"]:
                         st.dataframe(metrics["pre_scored_jobs"], width="stretch", hide_index=True)
                     else:
                         st.info("No jobs reached pre-scoring in this run.")
-
-                with st.expander("Sent to LLM"):
-                    sent_to_llm = metrics["jobs_sent_to_llm_rows"]
-                    if sent_to_llm:
-                        st.dataframe(sent_to_llm, width="stretch", hide_index=True)
-                    else:
-                        st.info("No jobs were sent to the LLM in this run.")
-
-                with st.expander("Final Job Queue", expanded=True):
-                    st.dataframe(metrics["queued_jobs"], width="stretch", hide_index=True)
 
     render_job_queue()
 
@@ -786,11 +800,29 @@ def render_job_queue() -> None:
         st.info("No discovered jobs yet.")
         return
 
+    queue_defaults = {
+        "post_time": "Unknown",
+        "job_level": "Unknown",
+        "work_mode": "Unknown",
+        "queue_category": "",
+        "rejection_reason": "",
+    }
+    for column_name, default_value in queue_defaults.items():
+        if column_name not in queue.columns:
+            queue[column_name] = default_value
+    queue["queue_category"] = queue["queue_category"].where(
+        queue["queue_category"].astype(str).str.strip() != "",
+        queue["apply_decision"],
+    )
+
     display_columns = [
         "company",
         "job_title",
         "location",
         "source",
+        "post_time",
+        "job_level",
+        "work_mode",
         "pre_filter_score",
         "fit_score",
         "apply_decision",
@@ -798,29 +830,58 @@ def render_job_queue() -> None:
         "status",
         "job_url",
     ]
-    filter_col1, filter_col2, filter_col3, filter_col4, filter_col5, filter_col6 = st.columns(6)
-    with filter_col1:
+    decision_col1, decision_col2 = st.columns(2)
+    with decision_col1:
         apply_only = st.checkbox("Apply only")
-    with filter_col2:
+    with decision_col2:
         maybe_only = st.checkbox("Maybe only")
+
+    filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
+    with filter_col1:
+        post_time_filter = st.text_input("Post time")
+    with filter_col2:
+        job_level_filter = st.selectbox(
+            "Job level",
+            ["All", "Internship", "Entry", "Junior", "Mid", "Senior", "Staff", "Principal", "Director", "Unknown"],
+        )
     with filter_col3:
-        minimum_fit_score = st.number_input("Minimum fit score", 0, 100, 0, 5)
+        work_mode_filter = st.selectbox("Work mode", ["All", "Remote", "Hybrid", "Onsite", "Unknown"])
     with filter_col4:
-        company_filter = st.text_input("Company filter")
+        source_filter = st.text_input("Source filter")
+
+    filter_col5, filter_col6, filter_col7, filter_col8 = st.columns(4)
     with filter_col5:
         location_filter = st.text_input("Location filter")
     with filter_col6:
-        source_filter = st.text_input("Source filter")
+        company_filter = st.text_input("Company filter")
+    with filter_col7:
+        minimum_pre_filter_score = st.number_input("Minimum pre-filter score", 0, 100, 0, 5)
+    with filter_col8:
+        minimum_fit_score = st.number_input("Minimum fit score", 0, 100, 0, 5)
 
     filtered_queue = queue.copy()
+    filtered_queue = filtered_queue[
+        filtered_queue["queue_category"].isin(["Apply", "Maybe"])
+    ]
     if apply_only and maybe_only:
         filtered_queue = filtered_queue[
-            filtered_queue["apply_decision"].isin(["Apply", "Maybe"])
+            filtered_queue["queue_category"].isin(["Apply", "Maybe"])
         ]
     elif apply_only:
-        filtered_queue = filtered_queue[filtered_queue["apply_decision"] == "Apply"]
+        filtered_queue = filtered_queue[filtered_queue["queue_category"] == "Apply"]
     elif maybe_only:
-        filtered_queue = filtered_queue[filtered_queue["apply_decision"] == "Maybe"]
+        filtered_queue = filtered_queue[filtered_queue["queue_category"] == "Maybe"]
+    if post_time_filter:
+        filtered_queue = filtered_queue[
+            filtered_queue["post_time"].str.contains(post_time_filter, case=False, na=False)
+        ]
+    if job_level_filter != "All":
+        filtered_queue = filtered_queue[filtered_queue["job_level"] == job_level_filter]
+    if work_mode_filter != "All":
+        filtered_queue = filtered_queue[filtered_queue["work_mode"] == work_mode_filter]
+    filtered_queue = filtered_queue[
+        filtered_queue["pre_filter_score"] >= minimum_pre_filter_score
+    ]
     filtered_queue = filtered_queue[filtered_queue["fit_score"] >= minimum_fit_score]
     if source_filter:
         filtered_queue = filtered_queue[
@@ -875,6 +936,7 @@ def render_job_queue() -> None:
 
     st.subheader("Tailored Resume Bullets")
     if not selected_prep.resume_bullets and selected_prep.jd_text:
+        st.caption("This uses an LLM call.")
         if st.button("Generate Application Prep"):
             if not st.session_state.user_profile.strip():
                 st.warning("Add your profile/resume on the Analyze Job page before generating prep.")

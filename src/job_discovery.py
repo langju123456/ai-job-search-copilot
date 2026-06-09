@@ -23,10 +23,12 @@ JOB_QUEUE_STATUS_OPTIONS = [
 
 APPLY_DECISIONS = ["Apply", "Maybe", "Skip"]
 REQUIRED_CSV_COLUMNS = ["company", "job_title", "location", "job_url", "jd_text"]
+OPTIONAL_CSV_COLUMNS = ["post_time", "job_level", "work_mode"]
 DEFAULT_PRE_FILTER_THRESHOLD = 40
 DEFAULT_MAX_JOBS_PER_RUN = 100
 DEFAULT_MAX_LLM_CALLS_PER_RUN = 10
 SAMPLE_DISCOVERED_JOBS_PATH = Path("data/sample_discovered_jobs.csv")
+LLM_TOKEN_ESTIMATE_PER_FULL_JOB = 750
 
 POSITIVE_KEYWORDS = [
     "ai",
@@ -78,6 +80,9 @@ HARD_NEGATIVE_KEYWORDS = [
     "warehouse",
     "cashier",
 ]
+
+SENIOR_LEVELS = ["Staff", "Principal", "Director"]
+QUEUE_CATEGORIES = ["Apply", "Maybe", "Filtered", "Rejected"]
 
 
 def now_iso() -> str:
@@ -201,7 +206,10 @@ def parse_csv_jobs(uploaded_file) -> list:
         raise ValueError(f"CSV is missing columns: {', '.join(missing_columns)}")
 
     jobs = []
-    for row in df[REQUIRED_CSV_COLUMNS].fillna("").to_dict(orient="records"):
+    available_columns = REQUIRED_CSV_COLUMNS + [
+        column for column in OPTIONAL_CSV_COLUMNS if column in df.columns
+    ]
+    for row in df[available_columns].fillna("").to_dict(orient="records"):
         jobs.append(
             {
                 "company": row["company"],
@@ -210,6 +218,9 @@ def parse_csv_jobs(uploaded_file) -> list:
                 "job_url": row["job_url"],
                 "jd_text": row["jd_text"],
                 "source": "csv",
+                "post_time": row.get("post_time", ""),
+                "job_level": row.get("job_level", ""),
+                "work_mode": row.get("work_mode", ""),
             }
         )
     return jobs
@@ -388,8 +399,11 @@ def load_sample_discovered_jobs() -> list:
             "job_url": row["job_url"],
             "jd_text": row["jd_text"],
             "source": "sample",
+            "post_time": row.get("post_time", ""),
+            "job_level": row.get("job_level", ""),
+            "work_mode": row.get("work_mode", ""),
         }
-        for row in df[REQUIRED_CSV_COLUMNS].fillna("").to_dict(orient="records")
+        for row in df.fillna("").to_dict(orient="records")
     ]
 
 
@@ -473,12 +487,102 @@ def record_discovery_run(
         conn.commit()
 
 
+def infer_job_level(title: str, jd_text: str) -> str:
+    text = f"{title} {jd_text}".lower()
+    if any(term in text for term in ["internship", "intern "]):
+        return "Internship"
+    if any(term in text for term in ["entry level", "new grad", "graduate"]):
+        return "Entry"
+    if "junior" in text:
+        return "Junior"
+    if "staff" in text:
+        return "Staff"
+    if "principal" in text:
+        return "Principal"
+    if any(term in text for term in ["director", "vp", "vice president"]):
+        return "Director"
+    if "senior" in text or re.search(r"\b(sr|sr\.)\b", text):
+        return "Senior"
+    if re.search(r"(4|5|6|7)\+?\s*(?:years|yrs)", text):
+        return "Mid"
+    if re.search(r"(0|1|2|3)\+?\s*(?:years|yrs)", text):
+        return "Junior"
+    return "Unknown"
+
+
+def infer_work_mode(location: str, jd_text: str) -> str:
+    text = f"{location} {jd_text}".lower()
+    if "remote" in text:
+        return "Remote"
+    if "hybrid" in text:
+        return "Hybrid"
+    if any(term in text for term in ["onsite", "on-site", "in office", "in-office"]):
+        return "Onsite"
+    return "Unknown"
+
+
+def infer_post_time(raw_text: str) -> str:
+    text = normalize_text(raw_text).lower()
+    patterns = [
+        r"posted\s+((?:today|yesterday|\d+\s+(?:hour|hours|day|days|week|weeks|month|months)\s+ago))",
+        r"\b((?:today|yesterday|\d+\s+(?:hour|hours|day|days|week|weeks|month|months)\s+ago))\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1).title()
+    return "Unknown"
+
+
+def should_filter_job(job: dict, settings: dict) -> dict:
+    text = combined_text(job)
+    allow_senior_roles = bool(settings.get("allow_senior_roles", False))
+    job_level = job.get("job_level", "Unknown")
+
+    for keyword in HARD_NEGATIVE_KEYWORDS:
+        if keyword in text:
+            return {
+                "filtered": True,
+                "category": "Rejected",
+                "reason": f"Rejected by low-quality keyword: {keyword}",
+            }
+
+    if not allow_senior_roles and job_level in SENIOR_LEVELS:
+        return {
+            "filtered": True,
+            "category": "Filtered",
+            "reason": f"Filtered by seniority: {job_level}",
+        }
+
+    if not allow_senior_roles and any(keyword in text for keyword in ["vp", "vice president"]):
+        return {
+            "filtered": True,
+            "category": "Filtered",
+            "reason": "Filtered by seniority: VP",
+        }
+
+    return {"filtered": False, "category": "", "reason": ""}
+
+
+def assign_queue_category(item: dict) -> str:
+    decision = item.get("apply_decision", "")
+    if decision in ["Apply", "Maybe"]:
+        return decision
+    if item.get("rejection_reason"):
+        return "Rejected"
+    return "Filtered"
+
+
 def normalize_job(job: dict) -> dict:
     jd_text = str(job.get("jd_text", "") or "").strip()
     job_url = normalize_text(job.get("job_url", ""))
     company = normalize_text(job.get("company", "")) or infer_company_from_url(job_url)
     job_title = normalize_text(job.get("job_title", "")) or infer_title_from_jd(jd_text)
     location = normalize_text(job.get("location", ""))
+    raw_text = " ".join([job_title, location, jd_text, normalize_text(job.get("post_time", ""))])
+    job_level = normalize_text(job.get("job_level", "")) or infer_job_level(job_title, jd_text)
+    work_mode = normalize_text(job.get("work_mode", "")) or infer_work_mode(location, jd_text)
+    post_time = normalize_text(job.get("post_time", "")) or infer_post_time(raw_text)
     return {
         "company": company,
         "job_title": job_title,
@@ -487,6 +591,9 @@ def normalize_job(job: dict) -> dict:
         "jd_text": jd_text,
         "short_description": short_description_from_jd(jd_text),
         "source": normalize_text(job.get("source", "")) or "manual",
+        "post_time": post_time,
+        "job_level": job_level,
+        "work_mode": work_mode,
     }
 
 
@@ -554,7 +661,7 @@ def combined_text(job: dict) -> str:
     ).lower()
 
 
-def rule_based_filter(job: dict, career_profile: dict) -> dict:
+def rule_based_filter(job: dict, career_profile: dict, allow_senior_roles: bool = False) -> dict:
     text = combined_text(job)
     title = job.get("job_title", "").lower()
     location = job.get("location", "").lower()
@@ -564,7 +671,7 @@ def rule_based_filter(job: dict, career_profile: dict) -> dict:
         if keyword in text:
             return {"passed": False, "reason": f"Filtered out by keyword: {keyword}"}
 
-    if any(keyword in title for keyword in ["staff", "principal", "director", "vp"]):
+    if not allow_senior_roles and any(keyword in title for keyword in ["staff", "principal", "director", "vp"]):
         return {"passed": False, "reason": "Filtered out by seniority"}
 
     if re.search(r"(8|9|10)\+?\s*(?:years|yrs)", text):
@@ -730,10 +837,15 @@ def empty_queue_item(job: dict) -> dict:
         "jd_text": job.get("jd_text", ""),
         "short_description": job.get("short_description", ""),
         "source": job.get("source", ""),
+        "post_time": job.get("post_time", "Unknown"),
+        "job_level": job.get("job_level", "Unknown"),
+        "work_mode": job.get("work_mode", "Unknown"),
         "pre_filter_score": 0,
         "fit_score": 0,
         "apply_decision": "Skip",
         "decision_reason": "",
+        "rejection_reason": "",
+        "queue_category": "Filtered",
         "status": "Skipped",
         "analysis_text": "",
         "resume_bullets": "",
@@ -771,10 +883,15 @@ def insert_job_queue_item(item: dict) -> int:
                 recruiter_message,
                 application_checklist,
                 sent_to_llm,
+                post_time,
+                job_level,
+                work_mode,
+                rejection_reason,
+                queue_category,
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 item["company"],
@@ -797,6 +914,11 @@ def insert_job_queue_item(item: dict) -> int:
                 item.get("recruiter_message", ""),
                 item.get("application_checklist", ""),
                 item.get("sent_to_llm", 0),
+                item.get("post_time", "Unknown"),
+                item.get("job_level", "Unknown"),
+                item.get("work_mode", "Unknown"),
+                item.get("rejection_reason", ""),
+                item.get("queue_category", assign_queue_category(item)),
                 timestamp,
                 timestamp,
             ),
@@ -805,27 +927,38 @@ def insert_job_queue_item(item: dict) -> int:
         return cursor.lastrowid
 
 
-def evaluate_job_without_llm(job: dict, career_profile: dict, pre_filter_threshold: int) -> dict:
+def evaluate_job_without_llm(
+    job: dict,
+    career_profile: dict,
+    pre_filter_threshold: int,
+    allow_senior_roles: bool = False,
+) -> dict:
     item = empty_queue_item(job)
-    rule_result = rule_based_filter(job, career_profile)
+    rule_result = rule_based_filter(job, career_profile, allow_senior_roles)
     if not rule_result["passed"]:
         item["decision_reason"] = rule_result["reason"]
+        item["rejection_reason"] = rule_result["reason"]
+        item["queue_category"] = "Filtered"
         return item
 
     pre_filter_score = keyword_pre_score(job, career_profile)
     item["pre_filter_score"] = pre_filter_score
     if pre_filter_score < pre_filter_threshold:
         item["decision_reason"] = f"Pre-filter score {pre_filter_score} is below threshold {pre_filter_threshold}."
+        item["rejection_reason"] = item["decision_reason"]
+        item["queue_category"] = "Filtered"
         return item
 
     if not job.get("jd_text", "").strip():
         item["apply_decision"] = "Maybe"
         item["status"] = "Discovered"
+        item["queue_category"] = "Maybe"
         item["decision_reason"] = "Passed pre-score, but no JD text is available. No scraping is performed."
         return item
 
     item["apply_decision"] = "Maybe"
     item["status"] = "Reviewed"
+    item["queue_category"] = "Maybe"
     item["decision_reason"] = "Passed pre-score and is eligible for LLM deep analysis."
     return item
 
@@ -843,6 +976,7 @@ def evaluate_job_with_llm(job: dict, item: dict, user_profile: str, career_profi
     item["status"] = "Ready to Apply" if decision["apply_decision"] == "Apply" else "Reviewed"
     if decision["apply_decision"] == "Skip":
         item["status"] = "Skipped"
+    item["queue_category"] = assign_queue_category(item)
     item["analysis_text"] = analysis
     item["sent_to_llm"] = 1
     return item
@@ -856,6 +990,7 @@ def process_discovered_jobs(
     pre_filter_threshold: int = DEFAULT_PRE_FILTER_THRESHOLD,
     max_llm_calls_per_run: int = DEFAULT_MAX_LLM_CALLS_PER_RUN,
     max_jobs_per_run: int = DEFAULT_MAX_JOBS_PER_RUN,
+    allow_senior_roles: bool = False,
 ) -> dict:
     selected_jobs = jobs[:max_jobs_per_run]
     normalized_jobs = [normalize_job(job) for job in selected_jobs]
@@ -863,6 +998,9 @@ def process_discovered_jobs(
 
     metrics = {
         "jobs_discovered": len(jobs),
+        "jobs_rejected_by_rules": 0,
+        "jobs_below_threshold": 0,
+        "jobs_filtered_rejected": len(duplicate_jobs),
         "jobs_filtered_out": len(duplicate_jobs),
         "duplicates_removed": len(duplicate_jobs),
         "total_new_jobs": len(unique_jobs),
@@ -871,9 +1009,14 @@ def process_discovered_jobs(
         "jobs_added_to_queue": 0,
         "actual_llm_calls_used": 0,
         "skipped_llm_calls": 0,
+        "llm_calls_avoided": len(duplicate_jobs),
         "estimated_token_savings": 0,
+        "estimated_tokens_saved": 0,
+        "token_savings_formula": f"llm_calls_avoided * {LLM_TOKEN_ESTIMATE_PER_FULL_JOB} tokens",
         "imported_jobs": normalized_jobs,
         "duplicate_jobs": duplicate_jobs,
+        "rejected_by_rules_jobs": [],
+        "below_threshold_jobs": [],
         "filtered_out_jobs": duplicate_jobs,
         "pre_scored_jobs": [],
         "jobs_sent_to_llm_rows": [],
@@ -884,19 +1027,48 @@ def process_discovered_jobs(
 
     if len(jobs) > max_jobs_per_run:
         over_limit = len(jobs) - max_jobs_per_run
+        metrics["jobs_filtered_rejected"] += over_limit
         metrics["jobs_filtered_out"] += over_limit
-        metrics["estimated_token_savings"] += over_limit * 750
+        metrics["llm_calls_avoided"] += over_limit
+        metrics["estimated_token_savings"] += over_limit * LLM_TOKEN_ESTIMATE_PER_FULL_JOB
 
     for duplicate_job in duplicate_jobs:
         duplicate_item = empty_queue_item(duplicate_job)
         duplicate_item["decision_reason"] = duplicate_job["duplicate_reason"]
+        duplicate_item["rejection_reason"] = duplicate_job["duplicate_reason"]
+        duplicate_item["queue_category"] = "Filtered"
         metrics["processed_jobs"].append(duplicate_item)
 
     for job in unique_jobs:
-        item = evaluate_job_without_llm(job, career_profile, pre_filter_threshold)
+        structured_filter = should_filter_job(job, {"allow_senior_roles": allow_senior_roles})
+        if structured_filter["filtered"]:
+            item = empty_queue_item(job)
+            item["decision_reason"] = structured_filter["reason"]
+            item["rejection_reason"] = structured_filter["reason"]
+            item["queue_category"] = structured_filter["category"]
+            metrics["jobs_rejected_by_rules"] += 1
+            metrics["jobs_filtered_rejected"] += 1
+            metrics["jobs_filtered_out"] += 1
+            metrics["llm_calls_avoided"] += 1
+            metrics["rejected_by_rules_jobs"].append(item)
+            metrics["filtered_out_jobs"].append(item)
+            metrics["processed_jobs"].append(item)
+            continue
+
+        item = evaluate_job_without_llm(job, career_profile, pre_filter_threshold, allow_senior_roles)
         if item["pre_filter_score"] > 0 or item["status"] in ["Reviewed", "Discovered"]:
             metrics["jobs_pre_scored"] += 1
             metrics["pre_scored_jobs"].append(item)
+
+        if item["pre_filter_score"] < pre_filter_threshold:
+            metrics["jobs_below_threshold"] += 1
+            metrics["jobs_filtered_rejected"] += 1
+            metrics["jobs_filtered_out"] += 1
+            metrics["llm_calls_avoided"] += 1
+            metrics["below_threshold_jobs"].append(item)
+            metrics["filtered_out_jobs"].append(item)
+            metrics["processed_jobs"].append(item)
+            continue
 
         eligible_for_llm = (
             item["pre_filter_score"] >= pre_filter_threshold
@@ -918,17 +1090,24 @@ def process_discovered_jobs(
             if llm_was_skipped:
                 metrics["skipped_llm_calls"] += 1
                 metrics["jobs_skipped_llm_rows"].append(item)
-            if item["status"] == "Skipped":
-                metrics["jobs_filtered_out"] += 1
-                metrics["filtered_out_jobs"].append(item)
             if not item["sent_to_llm"]:
-                metrics["estimated_token_savings"] += max(250, len(job.get("jd_text", "")) // 4)
+                metrics["llm_calls_avoided"] += 1
+                metrics["estimated_token_savings"] += LLM_TOKEN_ESTIMATE_PER_FULL_JOB
 
-        insert_job_queue_item(item)
-        metrics["jobs_added_to_queue"] += 1
-        metrics["queued_jobs"].append(item)
+        item["queue_category"] = assign_queue_category(item)
+        if item["queue_category"] in ["Apply", "Maybe"]:
+            insert_job_queue_item(item)
+            metrics["jobs_added_to_queue"] += 1
+            metrics["queued_jobs"].append(item)
+        else:
+            item["rejection_reason"] = item["decision_reason"]
+            metrics["jobs_filtered_rejected"] += 1
+            metrics["jobs_filtered_out"] += 1
+            metrics["filtered_out_jobs"].append(item)
         metrics["processed_jobs"].append(item)
 
+    metrics["estimated_tokens_saved"] = metrics["llm_calls_avoided"] * LLM_TOKEN_ESTIMATE_PER_FULL_JOB
+    metrics["estimated_token_savings"] = metrics["estimated_tokens_saved"]
     return metrics
 
 
@@ -941,6 +1120,7 @@ def run_discovery_pipeline(jobs: list, settings: dict) -> dict:
         int(settings.get("pre_filter_threshold", DEFAULT_PRE_FILTER_THRESHOLD)),
         int(settings.get("max_llm_calls_per_run", DEFAULT_MAX_LLM_CALLS_PER_RUN)),
         int(settings.get("max_jobs_per_run", DEFAULT_MAX_JOBS_PER_RUN)),
+        bool(settings.get("allow_senior_roles", False)),
     )
 
 
@@ -958,6 +1138,11 @@ def fetch_job_queue() -> pd.DataFrame:
                 jd_text,
                 short_description,
                 source,
+                COALESCE(post_time, 'Unknown') AS post_time,
+                COALESCE(job_level, 'Unknown') AS job_level,
+                COALESCE(work_mode, 'Unknown') AS work_mode,
+                COALESCE(NULLIF(queue_category, ''), apply_decision, '') AS queue_category,
+                COALESCE(rejection_reason, '') AS rejection_reason,
                 pre_filter_score,
                 fit_score,
                 apply_decision,
@@ -970,11 +1155,11 @@ def fetch_job_queue() -> pd.DataFrame:
                 created_at,
                 updated_at
             FROM job_queue
+            WHERE COALESCE(NULLIF(queue_category, ''), apply_decision, '') IN ('Apply', 'Maybe')
             ORDER BY
-                CASE apply_decision
+                CASE COALESCE(NULLIF(queue_category, ''), apply_decision, '')
                     WHEN 'Apply' THEN 1
                     WHEN 'Maybe' THEN 2
-                    WHEN 'Skip' THEN 3
                     ELSE 4
                 END,
                 fit_score DESC,

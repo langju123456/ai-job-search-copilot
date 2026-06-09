@@ -130,6 +130,11 @@ CREATE TABLE IF NOT EXISTS job_queue (
     filter_stage TEXT,
     filtered_out_reason TEXT,
     sent_to_llm INTEGER,
+    post_time TEXT,
+    job_level TEXT,
+    work_mode TEXT,
+    rejection_reason TEXT,
+    queue_category TEXT,
     created_at TEXT,
     updated_at TEXT
 )
@@ -203,6 +208,11 @@ JOB_QUEUE_COLUMN_DEFAULTS = {
     "filter_stage": "TEXT",
     "filtered_out_reason": "TEXT",
     "sent_to_llm": "INTEGER",
+    "post_time": "TEXT",
+    "job_level": "TEXT",
+    "work_mode": "TEXT",
+    "rejection_reason": "TEXT",
+    "queue_category": "TEXT",
     "updated_at": "TEXT",
 }
 
