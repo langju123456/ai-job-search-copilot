@@ -710,6 +710,26 @@ def render_job_discovery_page() -> None:
                     metrics = None
 
             if metrics:
+                metric_defaults = {
+                    "jobs_rejected_by_rules": 0,
+                    "jobs_below_threshold": 0,
+                    "jobs_filtered_rejected": metrics.get("jobs_filtered_out", 0),
+                    "jobs_added_to_queue": len(metrics.get("queued_jobs", [])),
+                    "actual_llm_calls_used": metrics.get("jobs_sent_to_llm", 0),
+                    "llm_calls_avoided": metrics.get("skipped_llm_calls", 0),
+                    "estimated_tokens_saved": metrics.get("estimated_token_savings", 0),
+                    "token_savings_formula": "llm_calls_avoided * 750 tokens",
+                    "rejected_by_rules_jobs": [],
+                    "below_threshold_jobs": [],
+                    "queued_jobs": [],
+                    "processed_jobs": [],
+                    "duplicate_jobs": [],
+                    "pre_scored_jobs": [],
+                    "jobs_sent_to_llm_rows": [],
+                }
+                for metric_key, default_value in metric_defaults.items():
+                    metrics.setdefault(metric_key, default_value)
+
                 record_discovery_run(
                     ", ".join(source_names) or "Manual Discovery",
                     ", ".join(sorted(set(source_types))) or "manual",
