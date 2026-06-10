@@ -41,7 +41,12 @@ from src.job_discovery import (
     update_job_queue_status,
     upsert_discovered_source,
 )
-from src.llm import get_openai_api_key, get_openai_model
+from src.llm import (
+    get_openai_api_key,
+    get_openai_model,
+    set_runtime_openai_api_key,
+    validate_openai_api_key,
+)
 from src.networking import generate_networking_messages
 from src.profile import (
     compute_career_profile_hash,
@@ -128,6 +133,11 @@ def initialize_session_state() -> None:
         "last_discovery_metrics": {},
         "last_discovery_settings": {},
         "selected_prep_job_id": 0,
+        "api_key_input": "",
+        "api_key_status": "",
+        "api_key_valid": False,
+        "pending_resume_text": "",
+        "onboarding_complete": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -259,6 +269,47 @@ def profile_strength_score(profile: dict) -> int:
     return round(sum(checks) / len(checks) * 100)
 
 
+def has_saved_profile(profile: dict) -> bool:
+    if not profile:
+        return False
+    checks = [
+        str(profile.get("headline", "") or "").strip(),
+        str(profile.get("summary", "") or "").strip(),
+        str(profile.get("target_roles", "") or "").strip(),
+        str(profile.get("skills", "") or "").strip(),
+        str(profile.get("profile_hash", "") or "").strip(),
+    ]
+    return any(checks) or bool(profile.get("projects", []) or profile.get("skills_inventory", []) or [])
+
+
+def get_saved_resume_context(profile: dict) -> str:
+    if st.session_state.get("user_profile", "").strip():
+        return st.session_state.user_profile.strip()
+    return compact_career_profile_text(profile) or career_profile_to_text(profile)
+
+
+def prime_sample_opportunities(profile: dict) -> dict:
+    settings = {
+        "target_roles": profile.get("target_roles", ""),
+        "target_locations": profile.get("preferred_locations", ""),
+        "keywords": "AI, GenAI, LLM, RAG, Python, FastAPI, SaaS",
+        "excluded_keywords": "Staff, Principal, Director, VP, commission only, unpaid",
+        "pre_filter_threshold": DEFAULT_PRE_FILTER_THRESHOLD,
+        "max_jobs_per_run": DEFAULT_MAX_JOBS_PER_RUN,
+        "max_llm_calls_per_run": 0,
+        "allow_senior_roles": False,
+        "force_refresh": False,
+        "user_profile": compact_career_profile_text(profile)
+        or "Early-career AI builder with Python, LLM application, and product-minded project experience.",
+        "career_profile": profile,
+        "career_profile_text": compact_career_profile_text(profile),
+    }
+    metrics = run_discovery_pipeline(load_sample_discovered_jobs(), settings)
+    st.session_state.last_discovery_metrics = metrics
+    st.session_state.last_discovery_settings = settings
+    return metrics
+
+
 def fetch_queue_records(include_all: bool = False) -> pd.DataFrame:
     init_db()
     with get_connection() as conn:
@@ -360,7 +411,7 @@ def archive_queue_job(queue_id: int) -> None:
 def render_profile_summary_card(profile: dict) -> None:
     st.subheader("Profile Summary")
     if not any(profile.values()):
-        st.info("Create a profile to personalize job matching.")
+        st.info("Upload your resume to personalize job matching.")
         return
 
     render_labeled_markdown_grid(
@@ -382,7 +433,7 @@ def render_profile_summary_card(profile: dict) -> None:
 
 def render_compact_profile_strip(profile: dict) -> None:
     if not any(profile.values()):
-        st.warning("Create a Career Profile first for better job matching.")
+        st.warning("Upload your resume first for better job matching.")
         return
     render_labeled_markdown_grid(
         [
@@ -398,7 +449,7 @@ def render_compact_profile_strip(profile: dict) -> None:
 def recommend_next_action(profile: dict, queue: pd.DataFrame, applications: pd.DataFrame) -> str:
     if queue.empty:
         if not any(profile.values()):
-            return "Create your career profile so the app can start finding better matches."
+            return "Upload your resume so the app can start finding better matches."
         return "Run job discovery to surface fresh matches and build your opportunities list."
 
     apply_jobs = queue[queue["queue_category"] == "Apply"]
@@ -466,6 +517,117 @@ def render_home_page() -> None:
     st.info(recommend_next_action(profile, queue, applications))
 
 
+def render_api_mode_selector(context: str = "onboarding") -> None:
+    st.subheader("Choose Your Mode")
+    mode = st.radio(
+        "Mode",
+        ["Bring Your Own OpenAI API Key", "Use Hosted Credits (Coming Soon)"],
+        index=0,
+        key=f"api_mode_{context}",
+    )
+    if mode == "Use Hosted Credits (Coming Soon)":
+        st.info("Hosted credits are coming soon. For now, use your own OpenAI API key.")
+
+    current_key = st.text_input(
+        "OpenAI API Key",
+        type="password",
+        value=st.session_state.get("api_key_input", ""),
+        key=f"api_key_input_{context}",
+        placeholder="sk-...",
+    )
+    st.caption("Your key stays in this session and is never shown back to you.")
+
+    validate_col1, validate_col2 = st.columns([1, 3])
+    with validate_col1:
+        if st.button("Validate", key=f"validate_api_key_{context}"):
+            is_valid, message = validate_openai_api_key(current_key)
+            st.session_state.api_key_input = current_key.strip()
+            st.session_state.api_key_valid = is_valid
+            st.session_state.api_key_status = message
+            if is_valid:
+                set_runtime_openai_api_key(current_key.strip())
+    with validate_col2:
+        active_key = get_openai_api_key()
+        if st.session_state.get("api_key_status"):
+            if st.session_state.get("api_key_valid"):
+                st.success(st.session_state["api_key_status"])
+            else:
+                st.warning(st.session_state["api_key_status"])
+        elif active_key:
+            st.success("Valid API key")
+            st.session_state.api_key_valid = True
+
+
+def render_onboarding_page() -> None:
+    st.header("Upload Resume")
+    st.caption("Supported: PDF, DOCX. Estimated time: under 30 seconds.")
+    render_api_mode_selector("onboarding")
+
+    uploaded_resume = st.file_uploader(
+        "Resume",
+        type=["pdf", "docx"],
+        key="onboarding_resume_upload",
+    )
+    if uploaded_resume:
+        populate_text_from_upload(uploaded_resume, "pending_resume_text", "resume")
+
+    analyze_button = st.button("Analyze My Resume", type="primary")
+    if analyze_button:
+        resume_text = st.session_state.get("pending_resume_text", "").strip()
+        if not resume_text:
+            st.warning("Upload your resume first so I can build your profile.")
+        elif not get_openai_api_key():
+            st.warning("Validate your OpenAI API key first.")
+        else:
+            try:
+                with st.spinner("Reading your resume and building your profile..."):
+                    profile = generate_career_profile_from_resume(resume_text)
+                    save_career_profile(profile)
+                    st.session_state.user_profile = resume_text
+                saved_profile = get_career_profile()
+                with st.spinner("Finding your first opportunities..."):
+                    prime_sample_opportunities(saved_profile)
+                st.session_state.onboarding_complete = True
+                st.success("Welcome. Your resume is in, and your first opportunities are ready.")
+                st.rerun()
+            except JSONDecodeError:
+                st.error("I couldn't turn that resume into a usable profile. Please try again.")
+            except Exception as exc:
+                st.error(f"Resume analysis failed: {exc}")
+
+
+def render_onboarding_success_page() -> None:
+    profile = get_career_profile()
+    queue = fetch_queue_records()
+    st.header("Welcome")
+    st.caption("You are ready to start from jobs, not setup.")
+    render_labeled_markdown_grid(
+        [
+            ("Suggested Roles", format_list_block(profile.get("target_roles", ""))),
+            ("Top Skills", compact_text(top_skill_names(profile))),
+        ]
+    )
+    st.subheader("Best Opportunities")
+    if queue.empty:
+        st.info("Your profile is ready. Start with Find Jobs to pull in your first matches.")
+    else:
+        starter_jobs = queue.sort_values(["fit_score", "pre_filter_score"], ascending=False).head(3)[
+            ["company", "job_title", "location", "fit_score", "decision_reason"]
+        ].rename(
+            columns={
+                "company": "Company",
+                "job_title": "Title",
+                "location": "Location",
+                "fit_score": "Match Score",
+                "decision_reason": "Why",
+            }
+        )
+        st.dataframe(format_decision_table(starter_jobs), width="stretch", hide_index=True)
+    if st.button("Find Jobs", type="primary"):
+        st.session_state.onboarding_complete = False
+        st.rerun()
+
+
 def render_setup_page() -> None:
     st.header("Career Profile Setup")
     profile = get_career_profile()
@@ -508,7 +670,7 @@ def render_setup_page() -> None:
 def render_career_profile_summary(profile: dict) -> None:
     st.subheader("Profile Summary")
     if not any(profile.values()):
-        st.info("No career profile saved yet.")
+        st.info("No saved profile yet.")
         return
 
     render_labeled_markdown_grid(
@@ -531,53 +693,56 @@ def render_career_profile_summary(profile: dict) -> None:
 
 def render_career_profile_page(show_header: bool = True) -> None:
     if show_header:
-        st.header("Career Profile")
+        st.header("My Profile")
     else:
-        st.subheader("Career Profile")
-    st.caption("Generate and edit the structured profile that powers job discovery, fit scoring, and application prep.")
+        st.subheader("My Profile")
+    st.caption("Your saved resume powers this page. Update the profile details here, and only replace the resume when you truly want a fresh read.")
 
-    st.subheader("Resume Input")
-    profile_upload = st.file_uploader(
-        "Upload resume",
-        type=["pdf", "docx", "txt"],
-        key="career_profile_upload",
-    )
-    populate_text_from_upload(profile_upload, "career_profile_resume_text", "career profile resume")
+    saved_profile = get_career_profile()
+    if not has_saved_profile(saved_profile):
+        st.warning("Upload your resume first to create your profile.")
+    else:
+        with st.expander("Replace Resume", expanded=False):
+            profile_upload = st.file_uploader(
+                "Upload a new resume",
+                type=["pdf", "docx", "txt"],
+                key="career_profile_upload",
+            )
+            populate_text_from_upload(profile_upload, "career_profile_resume_text", "resume")
+            st.text_area(
+                "Or paste replacement resume text",
+                key="career_profile_resume_text",
+                height=220,
+            )
 
-    st.text_area(
-        "Paste resume text",
-        key="career_profile_resume_text",
-        height=260,
-    )
-
-    if st.button("Generate Structured Profile from Resume", type="primary"):
+    if st.button("Refresh Profile From Resume", type="primary"):
         resume_text = st.session_state.get("career_profile_resume_text", "").strip()
         if not resume_text:
-            st.warning("Upload or paste your resume before generating a career profile.")
+            st.warning("Add a replacement resume first if you want me to refresh your profile.")
         elif not get_openai_api_key():
-            st.warning("OPENAI_API_KEY is missing. Add it to your .env file before generating a profile.")
+            st.warning("Add or validate your OpenAI API key first.")
         else:
             try:
-                with st.spinner("Generating career profile..."):
+                with st.spinner("Refreshing your profile from the new resume..."):
                     profile = generate_career_profile_from_resume(resume_text)
                     save_career_profile(profile)
                     st.session_state.user_profile = resume_text
-                st.success("Career profile generated and saved.")
+                st.success("Your profile has been refreshed.")
             except JSONDecodeError:
-                st.error("Profile generation failed because the model did not return valid structured JSON. Please try again.")
+                st.error("Profile refresh failed because the model did not return usable structured data.")
             except Exception as exc:
-                st.error(f"Profile generation failed: {exc}")
+                st.error(f"Profile refresh failed: {exc}")
 
     saved_profile = get_career_profile()
-    if not any(saved_profile.values()):
-        st.warning("Create a Career Profile first for better job matching.")
+    if not has_saved_profile(saved_profile):
+        st.warning("Create your profile first for better job matching.")
     render_career_profile_summary(saved_profile)
 
     if any(saved_profile.values()):
         st.divider()
         with st.form("career_profile_core_form"):
-            st.subheader("Core Profile")
-            st.caption("Edit the high-signal profile fields used across fit scoring, discovery, and prep.")
+            st.subheader("My Profile")
+            st.caption("These are the details the app uses to match you with roles and tailor applications.")
             core_col1, core_col2 = st.columns(2)
             with core_col1:
                 name = st.text_input("Name", value=saved_profile.get("name", ""))
@@ -652,8 +817,8 @@ def render_career_profile_page(show_header: bool = True) -> None:
                 st.rerun()
 
         st.divider()
-        st.subheader("Skill Graph")
-        st.caption("Keep the skill list concise and evidence-backed so matching stays sharp.")
+        st.subheader("Skills")
+        st.caption("Keep this list tight and evidence-based so your matches stay relevant.")
         skills_df = pd.DataFrame(
             saved_profile.get("skills_inventory", []),
             columns=["category", "skill_name", "proficiency", "evidence"],
@@ -671,8 +836,8 @@ def render_career_profile_page(show_header: bool = True) -> None:
             st.rerun()
 
         st.divider()
-        st.subheader("Project Memory")
-        st.caption("These projects are the strongest evidence layer for job-fit reasoning and resume tailoring.")
+        st.subheader("Projects")
+        st.caption("These projects are the proof points behind your best matches and application packs.")
         projects_df = pd.DataFrame(
             saved_profile.get("projects", []),
             columns=[
@@ -753,10 +918,10 @@ def render_career_profile_page(show_header: bool = True) -> None:
 
 def render_resume_assets_page(show_header: bool = True) -> None:
     if show_header:
-        st.header("Resume Assets")
+        st.header("Resume Content")
     else:
-        st.subheader("Resume Assets")
-    st.caption("Build a reusable bullet library so application prep can retrieve evidence first and only rewrite what matters.")
+        st.subheader("Resume Content")
+    st.caption("Save strong bullets and proof points once, then reuse them across future applications.")
 
     profile = get_career_profile()
     assets_df = fetch_resume_assets()
@@ -772,30 +937,30 @@ def render_resume_assets_page(show_header: bool = True) -> None:
         ]
     )
 
-    st.subheader("Generate From Career Profile Projects")
+    st.subheader("Generate From Projects")
     if not (profile.get("projects", []) or []):
-        st.warning("Add projects in Career Profile before generating resume assets.")
+        st.warning("Add projects in My Profile before generating resume content.")
     else:
-        st.caption("For each saved project, the app will generate 3 technical bullets, 2 business impact bullets, and 1 leadership/collaboration bullet.")
-        if st.button("Generate Resume Assets From Projects", type="primary"):
+        st.caption("For each saved project, the app can generate technical, business-impact, and collaboration bullets you can reuse later.")
+        if st.button("Generate Resume Content From Projects", type="primary"):
             if not get_openai_api_key():
-                st.warning("OPENAI_API_KEY is missing. Add it to your .env file before generating assets.")
+                st.warning("Add or validate your OpenAI API key first.")
             else:
                 try:
-                    with st.spinner("Generating reusable resume assets..."):
+                    with st.spinner("Generating reusable resume content..."):
                         generated_assets = generate_assets_from_career_profile(profile)
                         existing_assets = assets_df.to_dict("records")
                         save_resume_assets(existing_assets + generated_assets)
-                    st.success(f"Generated {len(generated_assets)} resume assets.")
+                    st.success(f"Generated {len(generated_assets)} reusable resume items.")
                     st.rerun()
                 except JSONDecodeError:
-                    st.error("Resume asset generation failed because the model did not return valid structured JSON.")
+                    st.error("Resume content generation failed because the model did not return usable structured data.")
                 except Exception as exc:
-                    st.error(f"Could not generate resume assets: {exc}")
+                    st.error(f"Could not generate resume content: {exc}")
 
     st.divider()
-    st.subheader("Asset Library")
-    st.caption("Add, edit, or delete assets here. Removing a row and saving deletes it from the local library.")
+    st.subheader("Resume Content Library")
+    st.caption("Add, edit, or delete saved bullets here. Removing a row and saving deletes it from your local library.")
     asset_columns = [
         "id",
         "asset_type",
@@ -822,10 +987,10 @@ def render_resume_assets_page(show_header: bool = True) -> None:
         },
         disabled=["created_at", "updated_at"],
     )
-    if st.button("Save Resume Assets"):
+    if st.button("Save Resume Content"):
         rows = dataframe_editor_rows(editable_assets)
         save_resume_assets(rows)
-        st.success("Resume assets saved.")
+        st.success("Resume content saved.")
         st.rerun()
 
 
@@ -844,25 +1009,40 @@ def render_score_breakdown() -> None:
 def render_analysis_page(show_header: bool = True) -> None:
     profile = get_career_profile()
     career_profile_text = career_profile_to_text(profile)
+    saved_resume_context = get_saved_resume_context(profile)
 
     if not get_openai_api_key():
-        st.warning("OPENAI_API_KEY is missing. Add it to your .env file before running AI analysis.")
+        st.warning("Add or validate your OpenAI API key first.")
 
     if show_header:
-        st.header("Analyze A Job")
-    st.subheader("User Profile / Resume")
-    resume_upload = st.file_uploader(
-        "Upload your profile or resume",
-        type=["pdf", "docx", "txt"],
-        key="resume_upload",
-    )
-    populate_text_from_upload(resume_upload, "user_profile", "resume/profile file")
-
-    st.text_area(
-        "Paste your profile or resume",
-        key="user_profile",
-        height=220,
-    )
+        st.header("Check One Job")
+    st.subheader("Your Saved Resume")
+    if saved_resume_context:
+        st.success("Using your saved resume intelligence from My Profile.")
+        with st.expander("Replace resume for this session", expanded=False):
+            resume_upload = st.file_uploader(
+                "Upload a replacement resume",
+                type=["pdf", "docx", "txt"],
+                key="resume_upload",
+            )
+            populate_text_from_upload(resume_upload, "user_profile", "resume/profile file")
+            st.text_area(
+                "Or paste replacement resume text",
+                key="user_profile",
+                height=220,
+            )
+    else:
+        resume_upload = st.file_uploader(
+            "Upload your resume",
+            type=["pdf", "docx", "txt"],
+            key="resume_upload",
+        )
+        populate_text_from_upload(resume_upload, "user_profile", "resume/profile file")
+        st.text_area(
+            "Paste your resume",
+            key="user_profile",
+            height=220,
+        )
 
     st.subheader("Job Description")
     st.caption("Paste one specific opportunity when you want a full deep-dive, tailored bullets, and networking help.")
@@ -889,12 +1069,13 @@ def render_analysis_page(show_header: bool = True) -> None:
     )
 
     if st.button("Analyze Job", type="primary"):
-        if not st.session_state.user_profile.strip():
-            st.warning("Please paste or upload your profile/resume before analyzing the job.")
+        active_resume_context = st.session_state.user_profile.strip() or saved_resume_context
+        if not active_resume_context:
+            st.warning("Upload your resume first so I can score this job properly.")
         elif not st.session_state.job_description.strip():
-            st.warning("Please paste or upload the job description before analyzing the job.")
+            st.warning("Paste or upload the job description first.")
         elif not get_openai_api_key():
-            st.warning("OPENAI_API_KEY is missing. Add it to your .env file before running AI analysis.")
+            st.warning("Add or validate your OpenAI API key first.")
         else:
             try:
                 selected_assets = retrieve_relevant_resume_assets(
@@ -905,7 +1086,7 @@ def render_analysis_page(show_header: bool = True) -> None:
                 selected_assets_text = resume_assets_to_text(selected_assets)
                 with st.spinner("Analyzing job fit..."):
                     st.session_state.analysis = analyze_job(
-                        st.session_state.user_profile,
+                        active_resume_context,
                         st.session_state.job_description,
                         career_profile_text,
                         selected_assets_text,
@@ -922,7 +1103,7 @@ def render_analysis_page(show_header: bool = True) -> None:
                     )
                 with st.spinner("Generating resume tailoring..."):
                     st.session_state.resume_tailoring = tailor_resume(
-                        st.session_state.user_profile,
+                        active_resume_context,
                         st.session_state.job_description,
                         career_profile_text,
                         selected_assets_text,
@@ -930,7 +1111,7 @@ def render_analysis_page(show_header: bool = True) -> None:
                     )
                 with st.spinner("Generating networking messages..."):
                     st.session_state.networking_messages = generate_networking_messages(
-                        st.session_state.user_profile,
+                        active_resume_context,
                         st.session_state.job_description,
                         career_profile_text,
                     )
@@ -1081,7 +1262,7 @@ def render_save_application_form() -> None:
                 else 0,
             )
             priority = st.selectbox(
-                "Pipeline Priority",
+                "Application Priority",
                 ["", "Must Apply", "Good Opportunity", "Low Priority"],
                 index=["", "Must Apply", "Good Opportunity", "Low Priority"].index(
                     st.session_state.priority
@@ -1221,26 +1402,26 @@ def render_analytics_page(show_header: bool = True) -> None:
 
 def render_job_discovery_page(show_header: bool = True, show_debug: bool = True) -> None:
     if show_header:
-        st.header("Discover Jobs")
+        st.header("Find Jobs")
     st.caption(
         "Discover jobs from public pages, CSV, manual paste, or sample data. "
-        "This page does not scrape LinkedIn, require login, or submit applications."
+        "The app helps you collect and sort opportunities, but it does not submit applications for you."
     )
     st.info(
         "Public URL discovery works best with public Greenhouse, Lever, Ashby, or company career pages. "
-        "It does not support login-only pages, does not scrape LinkedIn, and only reads static HTML in Sprint 5."
+        "It does not support login-only pages or LinkedIn, and works best when listings are visible directly on the page."
     )
 
     profile = get_career_profile()
     profile_text = compact_career_profile_text(profile)
-    st.subheader("Using Your Career Profile")
+    st.subheader("Using Your Saved Profile")
     if profile_text:
         render_compact_profile_strip(profile)
     else:
-        st.warning("Create a Career Profile first for better job matching.")
+        st.warning("Upload your resume first so the app can match you to jobs.")
 
     with st.form("job_discovery_form"):
-        st.subheader("Job Search Settings")
+        st.subheader("What are you looking for?")
         settings_col1, settings_col2 = st.columns(2)
         with settings_col1:
             target_roles = st.text_input(
@@ -1252,13 +1433,6 @@ def render_job_discovery_page(show_header: bool = True, show_debug: bool = True)
                 "Keywords",
                 value="AI, GenAI, LLM, RAG, Python, FastAPI, SaaS",
             )
-            pre_filter_threshold = st.number_input(
-                "Pre-filter threshold",
-                min_value=0,
-                max_value=100,
-                value=DEFAULT_PRE_FILTER_THRESHOLD,
-                step=5,
-            )
         with settings_col2:
             target_locations = st.text_input(
                 "Target locations",
@@ -1269,22 +1443,39 @@ def render_job_discovery_page(show_header: bool = True, show_debug: bool = True)
                 "Excluded keywords",
                 value="Staff, Principal, Director, VP, commission only, unpaid",
             )
-            max_jobs_per_run = st.number_input(
-                "Max jobs per run",
-                min_value=1,
-                max_value=200,
-                value=DEFAULT_MAX_JOBS_PER_RUN,
-                step=5,
-            )
-            allow_senior_roles = st.checkbox("Allow senior roles")
-            force_refresh = st.checkbox("Force refresh known jobs")
-        max_llm_calls_per_run = st.number_input(
-            "Max LLM calls per run",
-            min_value=0,
-            max_value=50,
-            value=DEFAULT_MAX_LLM_CALLS_PER_RUN,
-            step=1,
-        )
+        pre_filter_threshold = DEFAULT_PRE_FILTER_THRESHOLD
+        max_jobs_per_run = DEFAULT_MAX_JOBS_PER_RUN
+        max_llm_calls_per_run = DEFAULT_MAX_LLM_CALLS_PER_RUN
+        allow_senior_roles = False
+        force_refresh = False
+        if show_debug:
+            with st.expander("Advanced matching controls"):
+                advanced_col1, advanced_col2 = st.columns(2)
+                with advanced_col1:
+                    pre_filter_threshold = st.number_input(
+                        "Pre-filter threshold",
+                        min_value=0,
+                        max_value=100,
+                        value=DEFAULT_PRE_FILTER_THRESHOLD,
+                        step=5,
+                    )
+                    max_jobs_per_run = st.number_input(
+                        "Max jobs per run",
+                        min_value=1,
+                        max_value=200,
+                        value=DEFAULT_MAX_JOBS_PER_RUN,
+                        step=5,
+                    )
+                with advanced_col2:
+                    max_llm_calls_per_run = st.number_input(
+                        "Max LLM calls per run",
+                        min_value=0,
+                        max_value=50,
+                        value=DEFAULT_MAX_LLM_CALLS_PER_RUN,
+                        step=1,
+                    )
+                    allow_senior_roles = st.checkbox("Allow senior roles")
+                    force_refresh = st.checkbox("Refresh older saved matches")
 
         st.subheader("Sources")
         career_page_url = st.text_input(
@@ -1398,7 +1589,7 @@ def render_job_discovery_page(show_header: bool = True, show_debug: bool = True)
         if not jobs:
             st.warning("No jobs found. Add a public URL, CSV, manual jobs, job URLs, or enable sample dataset mode for a working demo.")
         elif jobs_with_descriptions and not has_analysis_context:
-            st.warning("Generate or complete your Career Profile before scoring jobs with descriptions.")
+            st.warning("Upload your resume first so I can score these jobs properly.")
         else:
             if jobs_with_descriptions and not get_openai_api_key() and int(max_llm_calls_per_run) > 0:
                 st.warning("OPENAI_API_KEY is missing. Running rule-based filtering and pre-scoring only.")
@@ -1577,18 +1768,19 @@ def render_job_discovery_page(show_header: bool = True, show_debug: bool = True)
                 )
 
 
-def render_job_queue(show_header: bool = True) -> None:
+def render_job_queue(show_header: bool = True, show_debug: bool = False) -> None:
     if show_header:
-        st.header("Best Matches")
-    maintenance_col1, maintenance_col2 = st.columns([1, 3])
-    with maintenance_col1:
-        if st.button("Clean Duplicate Queue Records"):
-            results = deduplicate_job_queue()
-            st.success(
-                f"Archived {results['duplicates_archived']} duplicate queue record(s). "
-                f"{results['active_records']} active record(s) remain."
-            )
-            st.rerun()
+        st.header("Top Matches")
+    if show_debug:
+        maintenance_col1, maintenance_col2 = st.columns([1, 3])
+        with maintenance_col1:
+            if st.button("Clean Duplicate Queue Records"):
+                results = deduplicate_job_queue()
+                st.success(
+                    f"Archived {results['duplicates_archived']} duplicate queue record(s). "
+                    f"{results['active_records']} active record(s) remain."
+                )
+                st.rerun()
     queue = fetch_queue_records()
     full_queue = fetch_queue_records(include_all=True)
 
@@ -1602,7 +1794,6 @@ def render_job_queue(show_header: bool = True) -> None:
         "location",
         "work_mode",
         "job_level",
-        "pre_filter_score",
         "fit_score",
         "apply_decision",
         "decision_reason",
@@ -1635,7 +1826,7 @@ def render_job_queue(show_header: bool = True) -> None:
             key="opps_work_mode_filter",
         )
     with filter_col8:
-        minimum_pre_filter_score = st.number_input("Minimum pre-filter score", 0, 100, 0, 5, key="opps_prefilter_min")
+        minimum_pre_filter_score = st.number_input("Minimum match quality", 0, 100, 0, 5, key="opps_prefilter_min")
 
     filtered_queue = queue.copy()
     if post_time_filter:
@@ -1682,7 +1873,6 @@ def render_job_queue(show_header: bool = True) -> None:
                 "work_mode": "Work Mode",
                 "status": "Status",
                 "source": "Source",
-                "pre_filter_score": "Pre-Score",
             }
         )
         st.dataframe(format_decision_table(display_best), width="stretch", hide_index=True)
@@ -1706,7 +1896,6 @@ def render_job_queue(show_header: bool = True) -> None:
                             "location": "Location",
                             "work_mode": "Work Mode",
                             "status": "Status",
-                            "pre_filter_score": "Pre-Score",
                         }
                     )
                 ),
@@ -1733,7 +1922,6 @@ def render_job_queue(show_header: bool = True) -> None:
                             "location": "Location",
                             "work_mode": "Work Mode",
                             "status": "Status",
-                            "pre_filter_score": "Pre-Score",
                         }
                     )
                 ),
@@ -1793,7 +1981,7 @@ def render_job_queue(show_header: bool = True) -> None:
             mime="text/csv",
         )
 
-    st.subheader("Take Next Action")
+    st.subheader("Take Action")
     options = {
         f"{row.company} - {row.job_title or 'Untitled Job'} (#{row.id})": int(row.id)
         for row in filtered_queue.itertuples()
@@ -1804,7 +1992,7 @@ def render_job_queue(show_header: bool = True) -> None:
 
     action_col1, action_col2 = st.columns([2, 3])
     with action_col1:
-        selected_job_label = st.selectbox("Opportunity", list(options.keys()))
+        selected_job_label = st.selectbox("Job", list(options.keys()))
         selected_job_id = options[selected_job_label]
         st.session_state.selected_prep_job_id = selected_job_id
     with action_col2:
@@ -1835,7 +2023,7 @@ def render_job_queue(show_header: bool = True) -> None:
     if apply_jobs.empty:
         return
 
-    st.subheader("Application Prep")
+    st.subheader("Application Pack")
     prep_options = {
         f"{row.company} - {row.job_title or 'Untitled Job'} (#{row.id})": row
         for row in apply_jobs.itertuples()
@@ -1860,7 +2048,7 @@ def render_job_queue(show_header: bool = True) -> None:
         format_func=lambda value: "Use asset-first mode" if value == "asset_first" else "Full LLM generation mode",
     )
 
-    st.subheader("Selected Resume Assets")
+    st.subheader("Selected Resume Content")
     if prep_assets:
         prep_assets_df = pd.DataFrame(prep_assets)[
             [
@@ -1875,22 +2063,22 @@ def render_job_queue(show_header: bool = True) -> None:
             ]
         ]
         st.dataframe(format_asset_table(prep_assets_df), width="stretch", hide_index=True)
-        st.caption("Application Prep sends only the top 5 matching assets in asset-first mode.")
+        st.caption("Application Pack uses only the top 5 matching saved items in asset-first mode.")
     else:
-        st.info("No matching resume assets were found yet. Add assets on the Resume Assets page or use Full LLM generation mode.")
+        st.info("No matching saved resume content was found yet. Add it in My Profile or use full generation mode.")
 
     st.subheader("Tailored Resume Bullets")
     if not selected_prep.resume_bullets and selected_prep.jd_text:
         st.caption("This uses an LLM call.")
         if st.button("Generate Application Prep", key=f"generate_prep_{selected_prep.id}") or generate_prep:
-            if not st.session_state.user_profile.strip():
-                st.warning("Add your profile/resume on the Analyze Job page before generating prep.")
+            if not get_saved_resume_context(prep_profile).strip():
+                st.warning("Add your resume first so I can generate an application pack.")
             elif not get_openai_api_key():
-                st.warning("OPENAI_API_KEY is missing. Add it to your .env file before generating prep.")
+                st.warning("Add or validate your OpenAI API key first.")
             else:
                 with st.spinner("Generating application prep..."):
                     prep = generate_application_prep(
-                        st.session_state.user_profile or compact_career_profile_text(get_career_profile()),
+                        get_saved_resume_context(prep_profile),
                         selected_prep.jd_text,
                         prep_profile,
                         compact_career_profile_text(prep_profile, selected_prep.jd_text),
@@ -1928,8 +2116,8 @@ def render_job_queue(show_header: bool = True) -> None:
 
 
 def render_profile_page() -> None:
-    st.header("Profile")
-    st.caption("This is your career memory: the profile, projects, skills, and reusable resume evidence behind every match.")
+    st.header("My Profile")
+    st.caption("This is the saved resume intelligence behind your matches, applications, and interview prep.")
     render_profile_summary_card(get_career_profile())
     st.divider()
     render_career_profile_page(show_header=False)
@@ -1938,17 +2126,17 @@ def render_profile_page() -> None:
 
 
 def render_opportunities_page() -> None:
-    st.header("Opportunities")
-    st.caption("Discover jobs, review your best matches, and move quickly on the ones worth applying to.")
+    st.header("Find Jobs")
+    st.caption("Start here to find strong matches, decide what is worth applying to, and build your next application pack.")
     profile = get_career_profile()
     render_compact_profile_strip(profile)
     discover_tab, queue_tab, analyze_tab = st.tabs(
-        ["Discover Jobs", "Best Matches", "Analyze A Specific Job"]
+        ["Find New Jobs", "Best Matches", "Check One Job"]
     )
     with discover_tab:
         render_job_discovery_page(show_header=False, show_debug=False)
     with queue_tab:
-        render_job_queue(show_header=False)
+        render_job_queue(show_header=False, show_debug=False)
     with analyze_tab:
         render_analysis_page(show_header=False)
 
@@ -1959,23 +2147,35 @@ def render_applications_page() -> None:
     applications = get_applications()
 
     if applications.empty:
+        status_counts = {
+            "Saved": 0,
+            "Applied": 0,
+            "Interview": 0,
+            "Offer": 0,
+            "Rejected": 0,
+            "No Response": 0,
+        }
+    else:
+        status_counts = {
+            "Saved": int((applications["status"] == "Saved").sum()),
+            "Applied": int((applications["status"] == "Applied").sum()),
+            "Interview": int((applications["status"] == "Interview").sum()),
+            "Offer": int((applications["status"] == "Offer").sum()),
+            "Rejected": int((applications["status"] == "Rejected").sum()),
+            "No Response": int(
+                (
+                    applications["outcome_status"].fillna("").eq("No Response")
+                    | applications["status"].fillna("").eq("No Response")
+                ).sum()
+            ),
+        }
+    metric_cols = st.columns(6)
+    for column, (label, count) in zip(metric_cols, status_counts.items()):
+        column.metric(label, count)
+
+    if applications.empty:
         st.info("No saved applications yet.")
         return
-
-    status_map = {
-        "Saved": applications["status"] == "Saved",
-        "Applied": applications["status"] == "Applied",
-        "Interview": applications["status"] == "Interview",
-        "Offer": applications["status"] == "Offer",
-        "Rejected": applications["status"] == "Rejected",
-        "No Response": (
-            applications["outcome_status"].fillna("").eq("No Response")
-            | applications["status"].fillna("").eq("No Response")
-        ),
-    }
-    metric_cols = st.columns(6)
-    for column, (label, mask) in zip(metric_cols, status_map.items()):
-        column.metric(label, int(mask.sum()))
 
     display = applications[
         [
@@ -2087,7 +2287,7 @@ def render_settings_page() -> None:
     api_col1, api_col2 = st.columns(2)
     with api_col1:
         st.subheader("API Settings")
-        st.metric("OpenAI API Key", "Configured" if get_openai_api_key() else "Missing")
+        render_api_mode_selector("settings")
         st.text_input("Model", value=get_openai_model(), disabled=True)
         st.caption("Future provider settings can live here later without changing the current app flow.")
     with api_col2:
@@ -2117,6 +2317,12 @@ def render_settings_page() -> None:
 
     st.divider()
     st.subheader("Advanced Debug")
+    if st.button("Clean Duplicate Queue Records"):
+        results = deduplicate_job_queue()
+        st.success(
+            f"Archived {results['duplicates_archived']} duplicate queue record(s). "
+            f"{results['active_records']} active record(s) remain."
+        )
     if not metrics:
         st.info("No discovery debug data in this session yet.")
     else:
@@ -2166,33 +2372,42 @@ def render_settings_page() -> None:
 
 initialize_session_state()
 
+if st.session_state.get("api_key_input") and st.session_state.get("api_key_valid"):
+    set_runtime_openai_api_key(st.session_state["api_key_input"])
+
 st.title("AI Job Search Copilot")
 
 st.info(
     "MVP note: Data is stored locally in SQLite. User data is only sent to the LLM API for analysis. No multi-user login yet."
 )
+active_profile = get_career_profile()
 
-page = st.sidebar.radio(
-    "Page",
-    [
-        "Home",
-        "Profile",
-        "Opportunities",
-        "Applications",
-        "Insights",
-        "Settings / Usage",
-    ],
-)
-
-if page == "Home":
-    render_home_page()
-elif page == "Profile":
-    render_profile_page()
-elif page == "Opportunities":
-    render_opportunities_page()
-elif page == "Applications":
-    render_applications_page()
-elif page == "Insights":
-    render_insights_page()
+if not has_saved_profile(active_profile):
+    render_onboarding_page()
+elif st.session_state.get("onboarding_complete"):
+    render_onboarding_success_page()
 else:
-    render_settings_page()
+    page = st.sidebar.radio(
+        "Page",
+        [
+            "Find Jobs",
+            "Applications",
+            "My Profile",
+            "Insights",
+            "Home",
+            "Settings / Usage",
+        ],
+    )
+
+    if page == "Find Jobs":
+        render_opportunities_page()
+    elif page == "Applications":
+        render_applications_page()
+    elif page == "My Profile":
+        render_profile_page()
+    elif page == "Insights":
+        render_insights_page()
+    elif page == "Home":
+        render_home_page()
+    else:
+        render_settings_page()

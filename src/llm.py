@@ -6,10 +6,28 @@ from openai import OpenAI
 
 
 load_dotenv()
+RUNTIME_OPENAI_API_KEY: Optional[str] = None
 
 
 def get_openai_api_key() -> Optional[str]:
-    return os.getenv("OPENAI_API_KEY")
+    return RUNTIME_OPENAI_API_KEY or os.getenv("OPENAI_API_KEY")
+
+
+def set_runtime_openai_api_key(api_key: str) -> None:
+    global RUNTIME_OPENAI_API_KEY
+    RUNTIME_OPENAI_API_KEY = (api_key or "").strip() or None
+
+
+def validate_openai_api_key(api_key: str) -> tuple[bool, str]:
+    cleaned = (api_key or "").strip()
+    if not cleaned:
+        return False, "Enter an OpenAI API key to continue."
+    try:
+        client = OpenAI(api_key=cleaned)
+        client.models.retrieve(get_openai_model())
+    except Exception:
+        return False, "Invalid API key or model access issue. Double-check the key and try again."
+    return True, "Valid API key"
 
 
 def get_openai_model() -> str:
