@@ -1,6 +1,7 @@
 import re
 from datetime import datetime
 from json import JSONDecodeError
+from typing import Optional
 
 import pandas as pd
 import streamlit as st
@@ -446,6 +447,185 @@ def render_compact_profile_strip(profile: dict) -> None:
     )
 
 
+def split_profile_terms(value: str) -> list[str]:
+    return [item.strip() for item in re.split(r"[,;\n]", str(value or "")) if item.strip()]
+
+
+def profile_skill_list(profile: dict, limit: int = 20) -> list[str]:
+    skill_names = []
+    for row in profile.get("skills_inventory", []) or []:
+        name = str(row.get("skill_name", "") or "").strip()
+        if name:
+            skill_names.append(name)
+    if not skill_names:
+        skill_names.extend(split_profile_terms(profile.get("skills", "")))
+    deduped = []
+    seen = set()
+    for item in skill_names:
+        key = item.lower()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(item)
+    return deduped[:limit]
+
+
+def role_candidates(profile: dict) -> list[str]:
+    roles = split_profile_terms(profile.get("target_roles", ""))
+    roles.extend(split_profile_terms(profile.get("acceptable_roles", "")))
+    deduped = []
+    seen = set()
+    for role in roles:
+        key = role.lower()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(role)
+    return deduped
+
+
+def fallback_missing_skills(profile: dict) -> list[dict]:
+    existing = split_profile_terms(profile.get("missing_skills", ""))
+    if existing:
+        return [{"skill": skill, "count": 1, "share": 0.0, "reason": "Already flagged in your saved profile."} for skill in existing[:3]]
+
+    role_text = " ".join(role_candidates(profile)).lower()
+    profile_skills = {skill.lower() for skill in profile_skill_list(profile)}
+    defaults = []
+    if any(term in role_text for term in ["ai", "genai", "llm", "applied ai"]):
+        defaults.extend(["AWS", "Kubernetes", "MLOps"])
+    elif "product" in role_text:
+        defaults.extend(["Experimentation", "SQL", "Analytics"])
+    else:
+        defaults.extend(["AWS", "SQL", "Docker"])
+    missing = [skill for skill in defaults if skill.lower() not in profile_skills]
+    return [
+        {
+            "skill": skill,
+            "count": 0,
+            "share": 0.0,
+            "reason": "Common requirement for your target roles.",
+        }
+        for skill in missing[:3]
+    ]
+
+
+def top_missing_skill_items(profile: dict, queue: pd.DataFrame, limit: int = 3) -> list[dict]:
+    missing_skills_df = fetch_most_common_missing_skills()
+    if missing_skills_df.empty:
+        return fallback_missing_skills(profile)
+
+    total_jobs = max(int(len(queue)), int(missing_skills_df["count"].max()), 1)
+    items = []
+    for row in missing_skills_df.head(limit).itertuples():
+        share = min(1.0, float(row.count) / float(total_jobs))
+        items.append(
+            {
+                "skill": row.missing_skill,
+                "count": int(row.count),
+                "share": share,
+                "reason": f"Appears in {round(share * 100)}% of your matching jobs.",
+            }
+        )
+    return items
+
+
+def best_role_summary(profile: dict) -> dict:
+    roles = role_candidates(profile)
+    headline = compact_text(profile.get("headline") or profile.get("summary"), "")
+    best_role = roles[0] if roles else ("AI Engineer" if "ai" in headline.lower() else "Applied AI Engineer")
+    secondary = roles[1:3] if len(roles) > 1 else ["GenAI Engineer", "Applied AI Engineer"]
+    top_skills = profile_skill_list(profile, limit=3)
+    if not top_skills:
+        top_skills = ["Python", "LLM Applications", "FastAPI"]
+    career_direction = headline or best_role
+    return {
+        "best_role": best_role,
+        "secondary_roles": secondary[:2],
+        "top_skills": top_skills[:3],
+        "career_direction": career_direction,
+    }
+
+
+def market_fit_snapshot(profile: dict, queue: pd.DataFrame, missing_items: list[dict]) -> dict:
+    profile_score = profile_strength_score(profile)
+    queue_score = 0
+    if not queue.empty:
+        queue_score = int(queue["fit_score"].fillna(0).head(5).mean())
+    overall_fit = round(profile_score * 0.55 + queue_score * 0.45) if queue_score else round(profile_score * 0.8 + min(len(profile_skill_list(profile)) * 4, 20))
+    skill_text = " ".join(profile_skill_list(profile, limit=20)).lower()
+    strong_areas = []
+    if any(term in skill_text for term in ["llm", "rag", "agent", "genai", "prompt"]):
+        strong_areas.append("AI Applications")
+    if "python" in skill_text:
+        strong_areas.append("Python")
+    if any(term in skill_text for term in ["streamlit", "fastapi", "api", "backend"]):
+        strong_areas.append("Application Engineering")
+    if any(term in skill_text for term in ["aws", "cloud", "gcp", "azure"]):
+        strong_areas.append("Cloud")
+    if not strong_areas:
+        strong_areas = ["Product Thinking", "Problem Solving", "Technical Execution"]
+
+    improvement_areas = [item["skill"] for item in missing_items[:3]]
+    return {
+        "overall_fit": max(0, min(100, overall_fit)),
+        "strong_areas": strong_areas[:3],
+        "improvement_areas": improvement_areas[:3],
+    }
+
+
+def top_opportunity_summary(profile: dict, queue: pd.DataFrame, missing_items: list[dict]) -> dict:
+    if queue.empty:
+        roles = role_candidates(profile)[:3] or ["AI Engineer", "GenAI Engineer", "Applied AI Engineer"]
+        return {
+            "empty": True,
+            "suggested_roles": roles,
+            "suggested_skills": [item["skill"] for item in missing_items[:3]],
+            "suggested_action": "Find jobs that mention Python, LLM applications, and business impact.",
+        }
+
+    top_job = queue.sort_values(["fit_score", "pre_filter_score"], ascending=False).iloc[0]
+    job_text = " ".join(
+        [
+            str(top_job.get("job_title", "") or ""),
+            str(top_job.get("short_description", "") or ""),
+            str(top_job.get("jd_text", "") or ""),
+            str(top_job.get("decision_reason", "") or ""),
+        ]
+    ).lower()
+    profile_skills = profile_skill_list(profile, limit=12)
+    matched_skills = [skill for skill in profile_skills if skill.lower() in job_text][:3]
+    if not matched_skills:
+        matched_skills = [item.strip("- ") for item in reason_to_bullets(top_job.get("decision_reason", "")).splitlines()[:3]]
+    missing_skills = [item["skill"] for item in missing_items if item["skill"].lower() in job_text][:3]
+    if not missing_skills:
+        missing_skills = [item["skill"] for item in missing_items[:2]]
+    return {
+        "empty": False,
+        "company": top_job["company"],
+        "job_title": top_job["job_title"],
+        "fit_score": int(top_job.get("fit_score", 0) or 0),
+        "why_matches": matched_skills[:3],
+        "missing": missing_skills[:3],
+        "job_url": top_job.get("job_url", ""),
+        "status": top_job.get("status", ""),
+        "job_id": int(top_job.get("id", 0) or 0),
+    }
+
+
+def recommended_primary_action(profile: dict, queue: pd.DataFrame, applications: pd.DataFrame, missing_items: list[dict]) -> str:
+    if not has_saved_profile(profile):
+        return "Analyze your resume"
+    if queue.empty:
+        return "Find jobs"
+    top_job = queue.sort_values(["fit_score", "pre_filter_score"], ascending=False).iloc[0]
+    if int(top_job.get("fit_score", 0) or 0) >= 85:
+        return f"Generate Application Pack for {top_job['company']}"
+    if missing_items:
+        return f"Improve {missing_items[0]['skill']}"
+    if not applications.empty:
+        return "Follow up on saved applications"
+    return "Review your best matches"
+
+
 def recommend_next_action(profile: dict, queue: pd.DataFrame, applications: pd.DataFrame) -> str:
     if queue.empty:
         if not any(profile.values()):
@@ -470,51 +650,107 @@ def recommend_next_action(profile: dict, queue: pd.DataFrame, applications: pd.D
     return "Review your Maybe jobs and decide which one deserves a tailored application next."
 
 
+def render_welcome_intelligence_card(profile: dict) -> None:
+    summary = best_role_summary(profile)
+    st.subheader(f"Welcome, {profile_display_name(profile)}.")
+    st.caption("This is the fastest read on who you are in the market right now.")
+    render_labeled_markdown_grid(
+        [
+            ("Best Role", summary["best_role"]),
+            ("Career Direction", summary["career_direction"]),
+            ("Secondary Roles", "\n".join(f"- {role}" for role in summary["secondary_roles"])),
+            ("Top Skills", "\n".join(f"- {skill}" for skill in summary["top_skills"])),
+        ]
+    )
+
+
+def render_market_fit_snapshot(profile: dict, queue: pd.DataFrame, missing_items: list[dict]) -> None:
+    snapshot = market_fit_snapshot(profile, queue, missing_items)
+    st.subheader("Market Fit Snapshot")
+    fit_col1, fit_col2 = st.columns([1, 2])
+    with fit_col1:
+        st.metric("Overall Fit Strength", f"{snapshot['overall_fit']} / 100")
+    with fit_col2:
+        render_labeled_markdown_grid(
+            [
+                ("Strong Areas", "\n".join(f"- {item}" for item in snapshot["strong_areas"])),
+                ("Improvement Areas", "\n".join(f"- {item}" for item in snapshot["improvement_areas"])),
+            ]
+        )
+
+
+def render_top_missing_skills(profile: dict, queue: pd.DataFrame, missing_items: Optional[list[dict]] = None) -> list[dict]:
+    if missing_items is None:
+        missing_items = top_missing_skill_items(profile, queue)
+    st.subheader("Top Missing Skills")
+    if not missing_items:
+        st.info("You already look well-aligned for your current target roles.")
+        return []
+
+    for index, item in enumerate(missing_items, start=1):
+        st.markdown(f"**{index}. {item['skill']}**")
+        st.caption(item["reason"])
+    return missing_items
+
+
+def render_top_opportunity_card(profile: dict, queue: pd.DataFrame, missing_items: list[dict]) -> None:
+    top_job = top_opportunity_summary(profile, queue, missing_items)
+    st.subheader("Top Opportunity")
+    if top_job.get("empty"):
+        st.info("Your profile is ready. Start with roles like these:")
+        st.markdown("\n".join(f"- {role}" for role in top_job["suggested_roles"]))
+        st.caption(f"Suggested next step: {top_job['suggested_action']}")
+        return
+
+    st.markdown(f"### {top_job['job_title']} @ {top_job['company']}")
+    highlight_col1, highlight_col2 = st.columns([1, 1])
+    with highlight_col1:
+        st.metric("Match Score", top_job["fit_score"])
+        st.markdown("**Why It Matches**")
+        st.markdown("\n".join(f"- {item}" for item in top_job["why_matches"]))
+    with highlight_col2:
+        st.markdown("**Missing**")
+        st.markdown("\n".join(f"- {item}" for item in top_job["missing"]))
+        st.markdown("**Recommended Action**")
+        st.markdown("Generate Application Pack")
+
+    button_col1, button_col2, button_col3 = st.columns(3)
+    with button_col1:
+        if top_job.get("job_url"):
+            st.link_button("View Job", top_job["job_url"])
+    with button_col2:
+        if st.button("Generate Application Pack", key=f"top_opp_generate_{top_job['job_id']}"):
+            st.session_state.selected_prep_job_id = top_job["job_id"]
+            st.success("Open Find Jobs -> Best Matches to generate the full application pack.")
+    with button_col3:
+        if st.button("Save For Later", key=f"top_opp_save_{top_job['job_id']}"):
+            update_job_queue_status(top_job["job_id"], "Reviewed")
+            st.success("Saved for later.")
+            st.rerun()
+
+
+def render_recommended_next_action(profile: dict, queue: pd.DataFrame, applications: pd.DataFrame, missing_items: list[dict]) -> None:
+    st.subheader("Recommended Next Action")
+    st.info(recommended_primary_action(profile, queue, applications, missing_items))
+
+
+def render_career_command_center(profile: dict, queue: pd.DataFrame, applications: pd.DataFrame) -> None:
+    render_welcome_intelligence_card(profile)
+    missing_items = top_missing_skill_items(profile, queue)
+    render_market_fit_snapshot(profile, queue, missing_items)
+    render_top_missing_skills(profile, queue, missing_items)
+    render_top_opportunity_card(profile, queue, missing_items)
+    render_recommended_next_action(profile, queue, applications, missing_items)
+
+
 def render_home_page() -> None:
     profile = get_career_profile()
     queue = fetch_queue_records()
     applications = get_applications()
 
     st.header(f"{current_greeting()}, {profile_display_name(profile)}.")
-    st.caption("Your AI job search workspace is tuned for better matches, clearer tradeoffs, and the next action that matters.")
-
-    summary_col1, summary_col2, summary_col3 = st.columns([1.1, 1, 1])
-    with summary_col1:
-        render_profile_summary_card(profile)
-    with summary_col2:
-        st.subheader("Career Focus")
-        st.metric("Profile Strength", f"{profile_strength_score(profile)}/100")
-        st.markdown("**Target Roles**")
-        st.markdown(format_list_block(profile.get("target_roles", "")))
-        st.markdown("**Preferred Locations**")
-        st.markdown(format_list_block(profile.get("preferred_locations", "")))
-    with summary_col3:
-        st.subheader("Snapshot")
-        st.metric("Best Matches", int(len(queue)))
-        st.metric("Applications", int(len(applications)))
-        st.metric("Interviews", int(len(applications[applications["status"] == "Interview"])))
-
-    st.subheader("Today's Best Opportunities")
-    if queue.empty:
-        st.info("No strong opportunities yet. Start with your profile, then run discovery.")
-    else:
-        top_opportunities = (
-            queue.sort_values(["fit_score", "pre_filter_score"], ascending=False)
-            .head(3)[["company", "job_title", "location", "fit_score", "decision_reason"]]
-            .rename(
-                columns={
-                    "job_title": "Title",
-                    "fit_score": "Match Score",
-                    "decision_reason": "Why It Matches",
-                    "company": "Company",
-                    "location": "Location",
-                }
-            )
-        )
-        st.dataframe(format_decision_table(top_opportunities), width="stretch", hide_index=True)
-
-    st.subheader("Recommended Next Action")
-    st.info(recommend_next_action(profile, queue, applications))
+    st.caption("Career Command Center")
+    render_career_command_center(profile, queue, applications)
 
 
 def render_api_mode_selector(context: str = "onboarding") -> None:
@@ -560,7 +796,7 @@ def render_api_mode_selector(context: str = "onboarding") -> None:
 
 def render_onboarding_page() -> None:
     st.header("Upload Resume")
-    st.caption("Supported: PDF, DOCX. Estimated time: under 30 seconds.")
+    st.caption("Supported: PDF, DOCX. You should see useful value in under 15 seconds.")
     render_api_mode_selector("onboarding")
 
     uploaded_resume = st.file_uploader(
@@ -580,13 +816,18 @@ def render_onboarding_page() -> None:
             st.warning("Validate your OpenAI API key first.")
         else:
             try:
+                progress_box = st.status("Reading your resume...", expanded=True)
+                progress_box.write("Extracting your background, roles, and strongest skills.")
                 with st.spinner("Reading your resume and building your profile..."):
                     profile = generate_career_profile_from_resume(resume_text)
                     save_career_profile(profile)
                     st.session_state.user_profile = resume_text
+                progress_box.update(label="Your profile is ready.", state="running")
+                progress_box.write("Now finding first opportunities based on your profile.")
                 saved_profile = get_career_profile()
                 with st.spinner("Finding your first opportunities..."):
                     prime_sample_opportunities(saved_profile)
+                progress_box.update(label="First value is ready.", state="complete")
                 st.session_state.onboarding_complete = True
                 st.success("Welcome. Your resume is in, and your first opportunities are ready.")
                 st.rerun()
@@ -599,30 +840,10 @@ def render_onboarding_page() -> None:
 def render_onboarding_success_page() -> None:
     profile = get_career_profile()
     queue = fetch_queue_records()
+    applications = get_applications()
     st.header("Welcome")
-    st.caption("You are ready to start from jobs, not setup.")
-    render_labeled_markdown_grid(
-        [
-            ("Suggested Roles", format_list_block(profile.get("target_roles", ""))),
-            ("Top Skills", compact_text(top_skill_names(profile))),
-        ]
-    )
-    st.subheader("Best Opportunities")
-    if queue.empty:
-        st.info("Your profile is ready. Start with Find Jobs to pull in your first matches.")
-    else:
-        starter_jobs = queue.sort_values(["fit_score", "pre_filter_score"], ascending=False).head(3)[
-            ["company", "job_title", "location", "fit_score", "decision_reason"]
-        ].rename(
-            columns={
-                "company": "Company",
-                "job_title": "Title",
-                "location": "Location",
-                "fit_score": "Match Score",
-                "decision_reason": "Why",
-            }
-        )
-        st.dataframe(format_decision_table(starter_jobs), width="stretch", hide_index=True)
+    st.caption("I read your resume and turned it into a job-search plan.")
+    render_career_command_center(profile, queue, applications)
     if st.button("Find Jobs", type="primary"):
         st.session_state.onboarding_complete = False
         st.rerun()
